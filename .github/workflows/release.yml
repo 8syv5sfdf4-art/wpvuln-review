@@ -106,5 +106,4 @@ jobs:
         with:
           files: artifacts/**/*
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN }}
