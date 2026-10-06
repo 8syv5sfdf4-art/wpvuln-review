@@ -72,4 +72,8 @@ pub enum Error {
     /// Inventory could not be taken
     #[error("inventory failed: {0}")]
     Inventory(String),
+
+    /// Aliases file could not be read or is invalid
+    #[error("invalid aliases file: {0}")]
+    Aliases(String),
 }
