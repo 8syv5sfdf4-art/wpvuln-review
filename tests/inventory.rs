@@ -404,3 +404,35 @@ fn rejects_unknown_file_types() {
         "{err}"
     );
 }
+
+#[test]
+fn cli_writes_a_clean_list_to_stdout() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["inventory", "--format", "list"])
+        .arg(fixture())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stdout.starts_with("RTL-CareUnit:1.7\nakismet:5.3\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("warning"));
+    assert!(
+        stderr
+            .contains("13 plugins, 2 themes, 1 must-use plugin, 1 drop-in, core 6.6.2, 5 warnings"),
+        "{stderr}"
+    );
+    parse_component_list(&stdout, ComponentType::Plugin).unwrap();
+}
+
+#[test]
+fn cli_fails_with_exit_10_on_bad_input() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["inventory", "/nonexistent/wp"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10));
+}

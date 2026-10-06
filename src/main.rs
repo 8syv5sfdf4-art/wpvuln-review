@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
     db::{self, PullEvent, PullOptions, PullStatus},
+    inventory::{self, Kind},
     output::{OutputConfig, OutputFormat, output_analysis},
     scanner::{
         ComponentInfo, ComponentType, ScanResult, Scanner, parse_component, parse_component_list,
@@ -81,6 +82,39 @@ enum Command {
     /// Manage a local vulnerability database for offline scans
     #[command(subcommand)]
     Db(DbCommand),
+    /// List installed core, plugins and themes from files (no network, no PHP)
+    Inventory(InventoryArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct InventoryArgs {
+    /// WordPress root, wp-content or plugins directory, or a .tar, .tar.gz or .zip of one
+    path: PathBuf,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// json: full inventory; list: slug:version lines for --plugins-file / --themes-file
+    #[arg(long, default_value = "json", value_enum)]
+    format: InventoryFormat,
+
+    /// Which components a list contains
+    #[arg(long = "type", default_value = "plugin", value_enum)]
+    list_type: ListType,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InventoryFormat {
+    Json,
+    List,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ListType {
+    Plugin,
+    Theme,
+    Core,
 }
 
 #[derive(Subcommand, Debug)]
@@ -172,6 +206,7 @@ async fn main() -> ExitCode {
 
     let result = match args.command {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
+        Some(Command::Inventory(ref inv)) => run_inventory(inv),
         None => {
             // Print banner for human output
             if matches!(args.output_format, OutputFormatArg::Human) {
@@ -557,6 +592,65 @@ async fn pull_cli(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    let inv = inventory::read(&args.path)?;
+    let text = match args.format {
+        InventoryFormat::Json => serde_json::to_string_pretty(&inv)? + "\n",
+        InventoryFormat::List => inv.to_list(match args.list_type {
+            ListType::Plugin => ComponentType::Plugin,
+            ListType::Theme => ComponentType::Theme,
+            ListType::Core => ComponentType::Core,
+        }),
+    };
+    match args.output {
+        Some(ref path) => std::fs::write(path, text)?,
+        None => {
+            use std::io::Write;
+            std::io::stdout().lock().write_all(text.as_bytes())?;
+        }
+    }
+
+    // Everything else goes to stderr, so stdout stays a clean file
+    let s = Style::stderr();
+    let plural = |n: usize, noun: &str| format!("{n} {noun}{}", if n == 1 { "" } else { "s" });
+    let count = |kind: Kind| inv.components.iter().filter(|c| c.kind == kind).count();
+    let mut parts = vec![
+        plural(count(Kind::Plugin), "plugin"),
+        plural(count(Kind::Theme), "theme"),
+    ];
+    for (kind, noun) in [
+        (Kind::MuPlugin, "must-use plugin"),
+        (Kind::Dropin, "drop-in"),
+    ] {
+        if count(kind) > 0 {
+            parts.push(plural(count(kind), noun));
+        }
+    }
+    if let Some(ref core) = inv.core {
+        parts.push(format!(
+            "core {}",
+            core.version.as_deref().unwrap_or("unknown")
+        ));
+    }
+    for w in &inv.warnings {
+        eprintln!("{} {w}", s.yellow("warning:"));
+    }
+    eprintln!(
+        "{} {} ({} layout): {}{}",
+        s.bold("Inventory"),
+        inv.source.path,
+        serde_json::to_value(inv.source.layout)?
+            .as_str()
+            .unwrap_or_default(),
+        parts.join(", "),
+        match inv.warnings.len() {
+            0 => String::new(),
+            n => format!(", {}", s.yellow(&plural(n, "warning"))),
+        }
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn ago(unix: u64) -> String {
