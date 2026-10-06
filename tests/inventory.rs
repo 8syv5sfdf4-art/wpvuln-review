@@ -101,6 +101,12 @@ fn reads_a_wordpress_root_like_wordpress_does() {
                 Some("2.18.0"),
                 "yith-woocommerce-product-bundles-premium/init.php"
             ),
+            (
+                Unloaded,
+                "akismet-old",
+                Some("4.0"),
+                "Old Plugins/akismet-old/akismet.php"
+            ),
             (MuPlugin, "loader", None, "loader.php"),
             (Dropin, "object-cache", Some("1.5.9"), "object-cache.php"),
             (Theme, "orphan-child", Some("0.1"), "orphan-child/style.css"),
@@ -168,6 +174,11 @@ fn warns_instead_of_guessing() {
     assert!(warned(&inv, "plugins/__MACOSX: macOS archive metadata"));
     assert!(warned(
         &inv,
+        "plugins/Old Plugins: not a plugin itself, but it holds 1 plugin copy WordPress does \
+         not load (akismet-old = Akismet Anti-spam 4.0)"
+    ));
+    assert!(warned(
+        &inv,
         "plugins: 1 archive file (old-backup.zip) not scanned"
     ));
     assert!(warned(
@@ -181,7 +192,7 @@ fn warns_instead_of_guessing() {
     // Silent files WordPress ignores too
     assert!(!warned(&inv, "plugins/index.php"));
     assert!(!warned(&inv, "notes.txt"));
-    assert!(!warned(&inv, "akismet"));
+    assert!(!warned(&inv, "plugins/akismet:"));
 }
 
 #[test]
@@ -192,7 +203,12 @@ fn accepts_wp_content_and_plugins_directories() {
 
     let plugins = inventory::read(&fixture().join("wp-content/plugins")).unwrap();
     assert_eq!(plugins.source.layout, Layout::Plugins);
-    assert!(plugins.components.iter().all(|c| c.kind == Kind::Plugin));
+    assert!(
+        plugins
+            .components
+            .iter()
+            .all(|c| matches!(c.kind, Kind::Plugin | Kind::Unloaded))
+    );
 
     let root = inventory::read(&fixture()).unwrap();
     let only_plugins = |inv: &Inventory| {
@@ -231,12 +247,15 @@ fn list_output_round_trips() {
     let list = inv.to_list(ComponentType::Plugin);
     assert!(list.contains("chaty-pro2:3.3.6\n"));
     assert!(list.contains("edge-after\n"));
+    assert!(list.ends_with(
+        "# not loaded by WordPress, but on disk: Old Plugins/akismet-old/akismet.php\nakismet-old:4.0\n"
+    ));
     let parsed = parse_component_list(&list, ComponentType::Plugin).unwrap();
     assert_eq!(
         parsed.len(),
         inv.components
             .iter()
-            .filter(|c| c.kind == Kind::Plugin)
+            .filter(|c| matches!(c.kind, Kind::Plugin | Kind::Unloaded))
             .count()
     );
 
@@ -479,7 +498,7 @@ fn cli_writes_a_clean_list_to_stdout() {
     assert!(!stdout.contains("warning"));
     assert!(
         stderr
-            .contains("13 plugins, 3 themes, 1 must-use plugin, 1 drop-in, core 6.6.2, 9 warnings"),
+            .contains("13 plugins, 3 themes, 1 must-use plugin, 1 drop-in, 1 unloaded plugin, core 6.6.2, 10 warnings"),
         "{stderr}"
     );
     parse_component_list(&stdout, ComponentType::Plugin).unwrap();

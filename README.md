@@ -140,6 +140,11 @@ themes (with their parent theme), core, and header details such as the text
 domain and plugin URI. `--format list` prints `slug:version` lines for
 `--plugins-file`; add `--type theme` or `--type core` for the other lists.
 
+Plugin copies sitting one folder too deep (say `plugins/Old Plugins/elementor/`)
+are not loaded by WordPress, but their files are still on disk and may be
+reachable over the web. They are listed as type `unloaded` and included in the
+plugin list (after a `#` comment), so they get scanned too.
+
 Files alone cannot tell whether a plugin is active. Where WP-CLI is installed,
 `--with-wp-cli` (plus `--wp-path DIR` and `--allow-root` if needed) adds each
 component's `status` and `update_version` from `wp plugin list` and

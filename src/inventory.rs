@@ -138,6 +138,10 @@ pub enum Kind {
     MuPlugin,
     /// Drop-in file in `wp-content/`
     Dropin,
+    /// Plugin inside a folder WordPress does not load, such as a backup
+    /// copy in `plugins/Old Plugins/`. It is not active, but its files are
+    /// still on disk and may be reachable over the web, so it is scanned.
+    Unloaded,
 }
 
 /// One installed plugin, theme, must-use plugin or drop-in
@@ -193,11 +197,17 @@ impl Inventory {
             }
             return out;
         }
-        let want = match kind {
-            ComponentType::Theme => Kind::Theme,
-            _ => Kind::Plugin,
+        let want: &[Kind] = match kind {
+            ComponentType::Theme => &[Kind::Theme],
+            _ => &[Kind::Plugin, Kind::Unloaded],
         };
-        for c in self.components.iter().filter(|c| c.kind == want) {
+        for c in self.components.iter().filter(|c| want.contains(&c.kind)) {
+            if c.kind == Kind::Unloaded {
+                out.push_str(&format!(
+                    "# not loaded by WordPress, but on disk: {}\n",
+                    c.main_file
+                ));
+            }
             if !crate::db::is_safe_key(&c.slug) {
                 out.push_str(&format!("# skipped {:?}: not a valid slug\n", c.slug));
                 continue;
@@ -826,6 +836,7 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
     let mut plugin_files: Vec<(String, String)> = Vec::new(); // (slug, main_file)
     let mut folders: Vec<(String, Vec<Entry>)> = Vec::new();
     let mut archives = Vec::new();
+    let mut nested_files: Vec<(String, String, String)> = Vec::new(); // (folder, slug, file)
     for e in tree.list(&plugins_dir, &mut warnings) {
         if e.name.starts_with('.') {
             continue;
@@ -835,6 +846,27 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
             for f in &entries {
                 if !f.is_dir && !f.name.starts_with('.') && f.name.ends_with(".php") {
                     plugin_files.push((e.name.clone(), format!("{}/{}", e.name, f.name)));
+                }
+            }
+            // A folder without PHP of its own may hold plugin copies one level down
+            let holds_php = entries
+                .iter()
+                .any(|f| !f.is_dir && !f.name.starts_with('.') && f.name.ends_with(".php"));
+            if !holds_php && e.name != "__MACOSX" {
+                for sub in entries
+                    .iter()
+                    .filter(|f| f.is_dir && !f.name.starts_with('.'))
+                {
+                    let sub_dir = format!("{}/{}", e.name, sub.name);
+                    for f in tree.list(&join(&plugins_dir, &sub_dir), &mut warnings) {
+                        if !f.is_dir && !f.name.starts_with('.') && f.name.ends_with(".php") {
+                            nested_files.push((
+                                e.name.clone(),
+                                sub.name.clone(),
+                                format!("{sub_dir}/{}", f.name),
+                            ));
+                        }
+                    }
                 }
             }
             folders.push((e.name, entries));
@@ -896,7 +928,9 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
     let core_file = join(&base, "wp-includes/version.php");
     let mut wanted: Vec<String> = plugin_files
         .iter()
-        .map(|(_, f)| join(&plugins_dir, f))
+        .map(|(_, f)| f)
+        .chain(nested_files.iter().map(|(_, _, f)| f))
+        .map(|f| join(&plugins_dir, f))
         .collect();
     wanted.extend(
         mu_files
@@ -942,6 +976,28 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         }
         components.push(component(Kind::Plugin, slug, name, file, &h));
     }
+    // Plugin copies inside folders WordPress does not load
+    let mut nested_in: HashMap<&str, Vec<String>> = HashMap::new();
+    for (folder, slug, file) in &nested_files {
+        let path = join(&plugins_dir, file);
+        let Some(bytes) = head(&path) else { continue };
+        let h = plugin_headers.parse(bytes);
+        let Some(name) = h.get("Plugin Name") else {
+            continue;
+        };
+        if !h.contains_key("Version") {
+            warnings.push(no_version(&path, "plugin"));
+        }
+        let version = h
+            .get("Version")
+            .map_or("no version".to_string(), |v| v.clone());
+        nested_in
+            .entry(folder)
+            .or_default()
+            .push(format!("{slug} = {name} {version}"));
+        components.push(component(Kind::Unloaded, slug, name, file, &h));
+    }
+
     for (folder, entries) in &folders {
         let path = join(&plugins_dir, folder);
         let php = entries
@@ -953,6 +1009,19 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
                 "{path}: macOS archive metadata (left behind when a zip made on a Mac is \
                  unpacked), not code. WordPress ignores it; it is safe to delete."
             )),
+            None if nested_in.contains_key(folder.as_str()) => {
+                let found = &nested_in[folder.as_str()];
+                warnings.push(format!(
+                    "{path}: not a plugin itself, but it holds {} plugin cop{} WordPress does \
+                     not load ({}). The files are still on disk, and if this folder is reachable \
+                     over the web the PHP can be requested directly, so each copy is inventoried \
+                     as type \"unloaded\" and scanned. Delete the folder if it only holds old \
+                     copies.",
+                    found.len(),
+                    if found.len() == 1 { "y" } else { "ies" },
+                    preview(found)
+                ));
+            }
             None if php == 0 => {
                 let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
                 warnings.push(format!(

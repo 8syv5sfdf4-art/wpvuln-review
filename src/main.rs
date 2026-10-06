@@ -651,6 +651,7 @@ fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<E
     for (kind, noun) in [
         (Kind::MuPlugin, "must-use plugin"),
         (Kind::Dropin, "drop-in"),
+        (Kind::Unloaded, "unloaded plugin"),
     ] {
         if count(kind) > 0 {
             parts.push(plural(count(kind), noun));
