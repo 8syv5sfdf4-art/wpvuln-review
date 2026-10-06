@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use wordpress_vulnerable_scanner::aliases::{Aliases, Lookup, MatchedVia};
+use wordpress_vulnerable_scanner::aliases::{Aliases, Known, Lookup, MatchedVia, render, suggest};
 use wordpress_vulnerable_scanner::inventory::{self, Component, Inventory, Kind};
 
 fn fixture() -> Inventory {
@@ -164,4 +164,135 @@ fn cli_inventory_takes_an_aliases_file() {
         .unwrap();
     assert_eq!(out.status.code(), Some(10));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a valid slug"));
+}
+
+fn targets(inv: &Inventory, slug: &str) -> Vec<(Kind, String, String)> {
+    let c = inv.components.iter().find(|c| c.slug == slug).unwrap();
+    wordpress_vulnerable_scanner::aliases::candidates(inv, c)
+        .into_iter()
+        .map(|c| (c.target.kind, c.target.slug, c.reasons.join(" | ")))
+        .collect()
+}
+
+fn t(kind: Kind, slug: &str, why: &str) -> (Kind, String, String) {
+    (kind, slug.to_string(), why.to_string())
+}
+
+#[test]
+fn candidate_heuristics() {
+    let mut inv = fixture();
+    use Kind::*;
+    assert_eq!(
+        targets(&inv, "chaty-pro2"),
+        vec![
+            t(Plugin, "chaty-pro", "dropped trailing digits"),
+            t(
+                Plugin,
+                "chaty",
+                "dropped trailing digits, dropped \"-pro\" | Text Domain header"
+            ),
+        ]
+    );
+    assert_eq!(
+        targets(&inv, "RTL-CareUnit"),
+        vec![t(Plugin, "rtl-careunit", "lowercased")]
+    );
+    assert_eq!(
+        targets(&inv, "yith-woocommerce-product-bundles-premium"),
+        vec![t(
+            Plugin,
+            "yith-woocommerce-product-bundles",
+            "dropped \"-premium\" | Text Domain header"
+        )]
+    );
+    assert_eq!(
+        targets(&inv, "hello"),
+        vec![t(
+            Plugin,
+            "hello-dolly",
+            "Plugin/Theme URI points to wordpress.org"
+        )]
+    );
+    assert_eq!(targets(&inv, "akismet"), vec![]);
+
+    // A plugin named after an installed theme is covered by that theme
+    let mut extra = inv.components[0].clone();
+    extra.slug = "storefront-plus".to_string();
+    extra.text_domain = None;
+    inv.components.push(extra);
+    let found = targets(&inv, "storefront-plus");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].0, found[0].1.as_str()), (Theme, "storefront"));
+    assert!(
+        found[0]
+            .2
+            .starts_with("named after the installed theme \"storefront\"")
+    );
+}
+
+/// Pretend database: these slugs are tracked, the rest untracked,
+/// "chaty-pro" was never pulled
+fn fake_known(kind: Kind, slug: &str) -> Known {
+    match (kind, slug) {
+        (Kind::Plugin, "akismet") => Known::Tracked(5),
+        (Kind::Plugin, "chaty") => Known::Tracked(2),
+        (Kind::Plugin, "chaty-pro") => Known::Missing,
+        (Kind::Theme, "storefront") => Known::Tracked(0),
+        _ => Known::Untracked,
+    }
+}
+
+#[test]
+fn suggestions_are_confirmed_against_a_database() {
+    let inv = fixture();
+    let existing = Aliases::parse("[plugin]\n\"RTL-CareUnit\" = \"rtl-careunit\"\n").unwrap();
+    let all = suggest(&inv, &existing, Some(&fake_known));
+    let get = |slug: &str| all.iter().find(|s| s.slug == slug);
+
+    // Tracked under its own slug, or already aliased: nothing to suggest
+    assert!(get("akismet").is_none());
+    assert!(get("storefront").is_none());
+    assert!(get("RTL-CareUnit").is_none());
+
+    let chaty = get("chaty-pro2").unwrap();
+    assert_eq!(chaty.own, Some(Known::Untracked));
+    assert_eq!(chaty.chosen, Some(1));
+    assert_eq!(chaty.candidates[1].target.slug, "chaty");
+    assert_eq!(chaty.candidates[0].known, Some(Known::Missing));
+
+    // Untracked with no candidates is still listed, to be explained
+    assert!(get("edge-after").unwrap().candidates.is_empty());
+
+    // Without a database, only components with candidates are listed
+    let unchecked = suggest(&inv, &existing, None);
+    assert!(
+        unchecked
+            .iter()
+            .all(|s| !s.candidates.is_empty() && s.chosen.is_none())
+    );
+}
+
+#[test]
+fn rendered_suggestions_match_golden_and_are_valid_toml() {
+    let inv = fixture();
+    let all = suggest(&inv, &Aliases::default(), Some(&fake_known));
+    let text = render(&all, "test database");
+
+    // Only confirmed lines are active, and they form a valid aliases file
+    let parsed = Aliases::parse(&text).unwrap();
+    assert_eq!(parsed.plugin.len(), 2);
+    assert_eq!(parsed.plugin["akismet-old"].slug, "akismet");
+    assert_eq!(parsed.plugin["chaty-pro2"].slug, "chaty");
+
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/aliases-suggest.toml");
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::write(&golden, &text).unwrap();
+    }
+    let expected = std::fs::read_to_string(&golden)
+        .expect("golden file missing; run with UPDATE_GOLDEN=1 to create it");
+    assert_eq!(
+        text, expected,
+        "rerun with UPDATE_GOLDEN=1 if the change is intended"
+    );
 }

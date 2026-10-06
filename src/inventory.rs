@@ -287,6 +287,27 @@ pub fn read(path: &Path) -> Result<Inventory> {
     Ok(inv)
 }
 
+/// Read an inventory JSON file (from `inventory -o`), or take a fresh
+/// inventory of anything [`read`] accepts
+pub fn load(path: &Path) -> Result<Inventory> {
+    let is_json = path.is_file() && path.extension().is_some_and(|e| e == "json");
+    if !is_json {
+        return read(path);
+    }
+    let bad = |why: String| Error::Inventory(format!("{}: {why}", path.display()));
+    let text = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
+    let inv: Inventory =
+        serde_json::from_str(&text).map_err(|e| bad(format!("not an inventory file ({e})")))?;
+    if inv.format != FORMAT_VERSION {
+        return Err(bad(format!(
+            "inventory format {} is not supported (expected {FORMAT_VERSION}); \
+             re-create it with this version",
+            inv.format
+        )));
+    }
+    Ok(inv)
+}
+
 /// Precompiled `get_file_data()` header patterns
 struct Headers(Vec<(&'static str, Regex)>);
 

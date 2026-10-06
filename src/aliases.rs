@@ -262,6 +262,303 @@ fn convert(
     Ok(out)
 }
 
+/// One possible lookup slug for an installed component
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Proposed target
+    pub target: Target,
+    /// Why it was proposed
+    pub reasons: Vec<String>,
+    /// What the database says about it, when one was consulted
+    pub known: Option<Known>,
+}
+
+/// Proposed alias for one installed plugin or theme
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    /// Table the alias belongs in ([`Kind::Plugin`] or [`Kind::Theme`])
+    pub table: Kind,
+    /// Installed slug (the alias key)
+    pub slug: String,
+    /// Human description: name, version and where it was found
+    pub label: String,
+    /// What the database says about the installed slug itself
+    pub own: Option<Known>,
+    /// Candidates, most likely first
+    pub candidates: Vec<Candidate>,
+    /// Index of the candidate confirmed as tracked, if any
+    pub chosen: Option<usize>,
+    /// Parent theme, for a child theme
+    pub parent: Option<String>,
+}
+
+pub use crate::db::Known;
+
+/// Suffixes that usually mark a premium edition or a copy of a plugin
+const SUFFIXES: [&str; 6] = ["--", "-old", "-main", "-master", "-premium", "-pro"];
+
+/// One renaming step towards a wordpress.org slug, with its reason
+fn strip_once(slug: &str) -> Option<(String, String)> {
+    for suffix in SUFFIXES {
+        if let Some(rest) = slug.strip_suffix(suffix)
+            && !rest.is_empty()
+        {
+            return Some((rest.to_string(), format!("dropped \"{suffix}\"")));
+        }
+    }
+    let rest = slug.trim_end_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.trim_end_matches(['-', '_']);
+    if rest.len() < slug.len() && rest.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Some((rest.to_string(), "dropped trailing digits".to_string()));
+    }
+    None
+}
+
+/// `wordpress.org/plugins/<slug>` (or `/themes/`) in a header URI
+fn wporg_slug(uri: &str, kind: Kind) -> Option<String> {
+    let dir = if kind == Kind::Theme {
+        "wordpress.org/themes/"
+    } else {
+        "wordpress.org/plugins/"
+    };
+    let rest = &uri[uri.find(dir)? + dir.len()..];
+    let slug = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
+    crate::db::is_safe_key(&slug).then_some(slug)
+}
+
+/// Candidate lookup slugs for one component, most likely first
+pub fn candidates(inv: &Inventory, c: &Component) -> Vec<Candidate> {
+    let own = if c.kind == Kind::Theme {
+        Kind::Theme
+    } else {
+        Kind::Plugin
+    };
+    let mut out: Vec<Candidate> = Vec::new();
+    let mut add = |kind: Kind, slug: String, reason: String| {
+        if !crate::db::is_safe_key(&slug) || (kind == own && slug == c.slug) {
+            return;
+        }
+        match out
+            .iter_mut()
+            .find(|x| x.target.kind == kind && x.target.slug == slug)
+        {
+            Some(x) => x.reasons.push(reason),
+            None => out.push(Candidate {
+                target: Target { kind, slug },
+                reasons: vec![reason],
+                known: None,
+            }),
+        }
+    };
+
+    for (header, uri) in [("Plugin/Theme URI", &c.uri), ("Update URI", &c.update_uri)] {
+        if let Some(slug) = uri.as_deref().and_then(|u| wporg_slug(u, own)) {
+            add(own, slug, format!("{header} points to wordpress.org"));
+        }
+    }
+    let mut slug = c.slug.to_ascii_lowercase();
+    let mut steps = Vec::new();
+    if slug != c.slug {
+        steps.push("lowercased".to_string());
+        add(own, slug.clone(), steps.join(", "));
+    }
+    while let Some((next, why)) = strip_once(&slug) {
+        steps.push(why);
+        add(own, next.clone(), steps.join(", "));
+        slug = next;
+    }
+    if let Some(td) = c.text_domain.as_deref() {
+        add(
+            own,
+            td.to_ascii_lowercase(),
+            "Text Domain header".to_string(),
+        );
+    }
+    if own == Kind::Plugin {
+        for theme in inv.components.iter().filter(|t| t.kind == Kind::Theme) {
+            let named = c.slug.starts_with(&format!("{}-", theme.slug))
+                || c.text_domain.as_deref() == Some(theme.slug.as_str());
+            if named {
+                add(
+                    Kind::Theme,
+                    theme.slug.clone(),
+                    format!(
+                        "named after the installed theme \"{}\"; such plugins usually ship with \
+                         the theme and share its version",
+                        theme.slug
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Answers what a database knows about a plugin or theme slug
+pub type KnownFn<'a> = &'a dyn Fn(Kind, &str) -> Known;
+
+/// Proposals for every plugin and theme without an alias yet. With
+/// `known`, candidates are checked against a database: components whose
+/// own slug is tracked are skipped, and the first tracked candidate is
+/// chosen.
+pub fn suggest(inv: &Inventory, existing: &Aliases, known: Option<KnownFn>) -> Vec<Suggestion> {
+    let mut out: Vec<Suggestion> = Vec::new();
+    for c in &inv.components {
+        let table = match c.kind {
+            Kind::Plugin | Kind::Unloaded => Kind::Plugin,
+            Kind::Theme => Kind::Theme,
+            Kind::MuPlugin | Kind::Dropin => continue,
+        };
+        let where_ = if c.kind == Kind::Unloaded {
+            format!("{}, not loaded by WordPress", c.main_file)
+        } else {
+            c.main_file.clone()
+        };
+        let label = format!(
+            "{} {} ({where_})",
+            c.name,
+            c.version.as_deref().unwrap_or("(no version)")
+        );
+        // A live plugin and an unloaded copy can share a folder name
+        if let Some(s) = out
+            .iter_mut()
+            .find(|s| s.table == table && s.slug == c.slug)
+        {
+            s.label = format!("{}; also {label}", s.label);
+            continue;
+        }
+        if existing.target(c.kind, &c.slug).is_some() {
+            continue;
+        }
+        let own = known.map(|k| k(table, &c.slug));
+        if matches!(own, Some(Known::Tracked(_))) {
+            continue;
+        }
+        let mut candidates = candidates(inv, c);
+        if let Some(k) = known {
+            for cand in &mut candidates {
+                cand.known = Some(k(cand.target.kind, &cand.target.slug));
+            }
+        }
+        if candidates.is_empty() && known.is_none() {
+            continue;
+        }
+        let chosen = candidates
+            .iter()
+            .position(|x| matches!(x.known, Some(Known::Tracked(_))));
+        out.push(Suggestion {
+            table,
+            slug: c.slug.clone(),
+            label,
+            own,
+            candidates,
+            chosen,
+            parent: c.parent.clone(),
+        });
+    }
+    out
+}
+
+fn describe(known: Option<Known>) -> String {
+    match known {
+        Some(Known::Tracked(0)) => "tracked, no known vulnerabilities".to_string(),
+        Some(Known::Tracked(1)) => "tracked, 1 record".to_string(),
+        Some(Known::Tracked(n)) => format!("tracked, {n} records"),
+        Some(Known::Untracked) => "not tracked".to_string(),
+        Some(Known::Missing) => "not in the database".to_string(),
+        None => "unconfirmed".to_string(),
+    }
+}
+
+fn toml_value(table: Kind, target: &Target) -> String {
+    if target.kind == table {
+        format!("\"{}\"", target.slug)
+    } else {
+        format!("{{ {} = \"{}\" }}", kind_name(target.kind), target.slug)
+    }
+}
+
+/// Suggestions as a commented TOML file. Only confirmed candidates are
+/// active lines; everything else is commented out for review.
+pub fn render(suggestions: &[Suggestion], checked_against: &str) -> String {
+    let mut out = String::from(
+        "# Alias suggestions. Nothing here is applied automatically: review each entry,\n\
+         # then copy the lines you agree with into aliases.toml.\n\
+         # Matches found through an alias are labelled \"alias\" in reports, because\n\
+         # premium editions may number their versions differently from the free plugin.\n",
+    );
+    out.push_str(&format!(
+        "# Candidates checked against: {checked_against}\n"
+    ));
+    for table in [Kind::Plugin, Kind::Theme] {
+        let rows: Vec<&Suggestion> = suggestions.iter().filter(|s| s.table == table).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n[{}]\n", kind_name(table)));
+        for s in rows {
+            out.push_str(&format!("\n# {}: {}\n", s.slug, s.label));
+            if let Some(own) = s.own {
+                out.push_str(&format!("#   own slug: {}\n", describe(Some(own))));
+            }
+            if let (true, Some(parent)) = (s.candidates.is_empty(), &s.parent) {
+                out.push_str(&format!(
+                    "#   child theme of \"{parent}\": it holds this site's own changes, which no\n\
+                     #   database covers, so review it by hand. The parent is checked on its own.\n"
+                ));
+                continue;
+            }
+            if s.candidates.is_empty() {
+                out.push_str(
+                    "#   no candidate slug found. Probably custom or marketplace code that no\n\
+                     #   database covers; it stays \"not checked\", so review it by hand.\n",
+                );
+                continue;
+            }
+            for c in &s.candidates {
+                out.push_str(&format!(
+                    "#   {} = {}: {}\n",
+                    s.slug,
+                    toml_value(table, &c.target),
+                    [describe(c.known)]
+                        .into_iter()
+                        .chain(c.reasons.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+            let missing = s
+                .candidates
+                .iter()
+                .find(|c| c.known == Some(Known::Missing));
+            match (s.chosen, missing) {
+                (Some(i), _) => out.push_str(&format!(
+                    "\"{}\" = {}\n",
+                    s.slug,
+                    toml_value(table, &s.candidates[i].target)
+                )),
+                (None, Some(m)) => out.push_str(&format!(
+                    "#   not in the database yet, so unconfirmed: rerun with --online, or\n\
+                     #   `db pull -p {}` first.\n# \"{}\" = {}\n",
+                    m.target.slug,
+                    s.slug,
+                    toml_value(table, &m.target)
+                )),
+                (None, None) if s.candidates.iter().any(|c| c.known.is_some()) => out.push_str(
+                    "#   none of these is tracked, so there is nothing to map to; it stays\n\
+                     #   \"not checked\".\n",
+                ),
+                (None, None) => out.push_str(&format!(
+                    "# \"{}\" = {}\n",
+                    s.slug,
+                    toml_value(table, &s.candidates[0].target)
+                )),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

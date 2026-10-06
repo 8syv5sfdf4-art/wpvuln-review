@@ -85,6 +85,26 @@ enum Command {
     Db(DbCommand),
     /// List installed core, plugins and themes from files (no network, no PHP)
     Inventory(InventoryArgs),
+    /// Work with slug aliases (installed folder name -> wordpress.org slug)
+    #[command(subcommand)]
+    Aliases(AliasesCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum AliasesCommand {
+    /// Propose aliases for an inventory; prints TOML to review, never writes files
+    Suggest {
+        /// inventory.json, or a directory or archive to inventory first
+        input: PathBuf,
+
+        /// Confirm candidates against this local database
+        #[arg(long, env = "WPVULN_DB", value_name = "DIR")]
+        db: Option<PathBuf>,
+
+        /// Existing aliases file; components it already maps are skipped
+        #[arg(long, env = "WPVULN_ALIASES", value_name = "FILE")]
+        aliases: Option<PathBuf>,
+    },
 }
 
 #[derive(ClapArgs, Debug)]
@@ -224,6 +244,7 @@ async fn main() -> ExitCode {
     let result = match args.command {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
         Some(Command::Inventory(ref inv)) => run_inventory(inv),
+        Some(Command::Aliases(ref cmd)) => run_aliases(cmd),
         None => {
             // Print banner for human output
             if matches!(args.output_format, OutputFormatArg::Human) {
@@ -698,6 +719,54 @@ fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<E
             );
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_aliases(cmd: &AliasesCommand) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    let AliasesCommand::Suggest {
+        input,
+        db: db_dir,
+        aliases,
+    } = cmd;
+    let inv = inventory::load(input)?;
+    let existing = match aliases {
+        Some(path) => Aliases::load(path)?,
+        None => Aliases::default(),
+    };
+    let lookup = |kind: Kind, slug: &str| {
+        let kind = match kind {
+            Kind::Theme => ComponentType::Theme,
+            _ => ComponentType::Plugin,
+        };
+        db::known(db_dir.as_deref().unwrap_or(Path::new("")), kind, slug)
+    };
+    let known: Option<wordpress_vulnerable_scanner::aliases::KnownFn> = match db_dir {
+        Some(_) => Some(&lookup),
+        None => None,
+    };
+    let suggestions = wordpress_vulnerable_scanner::aliases::suggest(&inv, &existing, known);
+    let checked = match db_dir {
+        Some(dir) => format!("local database {}", dir.display()),
+        None => "nothing (add --db DIR to confirm them)".to_string(),
+    };
+    print!(
+        "{}",
+        wordpress_vulnerable_scanner::aliases::render(&suggestions, &checked)
+    );
+
+    let s = Style::stderr();
+    let confirmed = suggestions.iter().filter(|x| x.chosen.is_some()).count();
+    let without = suggestions
+        .iter()
+        .filter(|x| x.candidates.is_empty())
+        .count();
+    eprintln!(
+        "{} {} component{}: {confirmed} confirmed, {} to review, {without} without candidates",
+        s.bold("Suggestions for"),
+        suggestions.len(),
+        if suggestions.len() == 1 { "" } else { "s" },
+        suggestions.len() - confirmed - without
+    );
     Ok(ExitCode::SUCCESS)
 }
 

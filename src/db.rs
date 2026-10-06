@@ -403,6 +403,29 @@ pub fn status(dir: &Path) -> Result<DbStatus> {
     Ok(st)
 }
 
+/// What a local database knows about one component
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Known {
+    /// Tracked, with this many vulnerability records
+    Tracked(usize),
+    /// Looked up, but WPVulnerability has no entry for it
+    Untracked,
+    /// Never pulled into this database (or unreadable)
+    Missing,
+}
+
+/// Look up one component's stored record
+pub fn known(dir: &Path, kind: ComponentType, key: &str) -> Known {
+    match record_path(dir, kind, key)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|b| record_kind(&b))
+    {
+        Some(RecordKind::Tracked(n)) => Known::Tracked(n),
+        Some(RecordKind::Untracked) => Known::Untracked,
+        None => Known::Missing,
+    }
+}
+
 /// Components from `items` that have no record in `dir`
 pub fn missing<'a>(
     dir: &Path,
