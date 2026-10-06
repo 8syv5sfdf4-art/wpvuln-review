@@ -296,3 +296,78 @@ fn rendered_suggestions_match_golden_and_are_valid_toml() {
         "rerun with UPDATE_GOLDEN=1 if the change is intended"
     );
 }
+
+#[tokio::test]
+async fn online_suggestions_fetch_only_what_the_database_lacks() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wordpress_vulnerable_scanner::aliases::suggest_online;
+    use wordpress_vulnerable_scanner::db::PullOptions;
+
+    let tracked = |n: usize| {
+        let entries: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"uuid":"u{i}","name":"v{i}","operator":{{"max_version":"1.0","max_operator":"lt"}}}}"#))
+            .collect();
+        format!(
+            r#"{{"error":0,"message":null,"data":{{"name":"x","vulnerability":[{}]}}}}"#,
+            entries.join(",")
+        )
+    };
+    let server = MockServer::start().await;
+    for (p, status, body) in [
+        ("/plugin/akismet/", 200, tracked(3)),
+        ("/plugin/chaty/", 200, tracked(2)),
+        ("/plugin/chaty-pro/", 500, String::new()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+    }
+    // Already in the local database: must not be fetched again
+    Mock::given(method("GET"))
+        .and(path("/plugin/hello-dolly/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tracked(1)))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let db = std::env::temp_dir().join(format!("wvs-online-db-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&db);
+    std::fs::create_dir_all(db.join("plugin")).unwrap();
+    std::fs::write(db.join("plugin/hello-dolly.json"), tracked(1)).unwrap();
+
+    let opts = PullOptions {
+        api_url: server.uri(),
+        attempts: 1,
+        delay: std::time::Duration::ZERO,
+        ..PullOptions::default()
+    };
+    let inv = fixture();
+    let (all, failed) = suggest_online(&inv, &Aliases::default(), Some(&db), &opts)
+        .await
+        .unwrap();
+    let get = |slug: &str| all.iter().find(|s| s.slug == slug);
+
+    assert!(get("akismet").is_none(), "tracked under its own slug");
+    let chaty = get("chaty-pro2").unwrap();
+    assert_eq!(chaty.candidates[chaty.chosen.unwrap()].target.slug, "chaty");
+    assert_eq!(chaty.candidates[0].known, Some(Known::Missing));
+    assert_eq!(failed, vec!["chaty-pro: HTTP 500".to_string()]);
+    let hello = get("hello").unwrap();
+    assert_eq!(
+        hello.candidates[hello.chosen.unwrap()].target.slug,
+        "hello-dolly"
+    );
+    // 404 means not tracked
+    assert_eq!(get("RTL-CareUnit").unwrap().own, Some(Known::Untracked));
+
+    // The local database is left exactly as it was
+    let files: Vec<_> = std::fs::read_dir(db.join("plugin"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert!(!db.join("wpvuln-db.json").exists());
+}

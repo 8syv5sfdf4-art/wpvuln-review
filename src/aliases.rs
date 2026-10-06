@@ -23,8 +23,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::{PullEvent, PullOptions, PullStatus};
 use crate::error::{Error, Result};
 use crate::inventory::{Component, Inventory, Kind};
+use crate::scanner::ComponentType;
 
 /// Where an alias points
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,6 +459,82 @@ pub fn suggest(inv: &Inventory, existing: &Aliases, known: Option<KnownFn>) -> V
         });
     }
     out
+}
+
+/// Every slug [`suggest`] would ask about: each unaliased plugin's and
+/// theme's own slug plus all its candidates, without duplicates
+pub fn lookups_needed(inv: &Inventory, existing: &Aliases) -> Vec<(Kind, String)> {
+    let mut out: Vec<(Kind, String)> = Vec::new();
+    for c in &inv.components {
+        let own = match c.kind {
+            Kind::Plugin | Kind::Unloaded => Kind::Plugin,
+            Kind::Theme => Kind::Theme,
+            Kind::MuPlugin | Kind::Dropin => continue,
+        };
+        if existing.target(c.kind, &c.slug).is_some() {
+            continue;
+        }
+        let wanted = std::iter::once((own, c.slug.clone())).chain(
+            candidates(inv, c)
+                .into_iter()
+                .map(|x| (x.target.kind, x.target.slug)),
+        );
+        for item in wanted {
+            if crate::db::is_safe_key(&item.1) && !out.contains(&item) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn component_type(kind: Kind) -> ComponentType {
+    if kind == Kind::Theme {
+        ComponentType::Theme
+    } else {
+        ComponentType::Plugin
+    }
+}
+
+/// Like [`suggest`] with a database, but slugs the local database `db`
+/// lacks (or all of them, without one) are fetched from the API first.
+/// They go into a temporary directory that is removed afterwards, so the
+/// local database is never changed. Returns the suggestions and the
+/// lookups that failed (those read as [`Known::Missing`]).
+pub async fn suggest_online(
+    inv: &Inventory,
+    existing: &Aliases,
+    db: Option<&Path>,
+    opts: &PullOptions,
+) -> Result<(Vec<Suggestion>, Vec<String>)> {
+    let local = |kind: Kind, slug: &str| {
+        db.map_or(Known::Missing, |d| {
+            crate::db::known(d, component_type(kind), slug)
+        })
+    };
+    let fetch: Vec<(ComponentType, String)> = lookups_needed(inv, existing)
+        .into_iter()
+        .filter(|(kind, slug)| local(*kind, slug) == Known::Missing)
+        .map(|(kind, slug)| (component_type(kind), slug))
+        .collect();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = std::env::temp_dir().join(format!("wpvuln-suggest-{}-{stamp}", std::process::id()));
+    let mut failed = Vec::new();
+    let pulled = crate::db::pull(&tmp, &fetch, opts, |e: &PullEvent| {
+        if let PullStatus::Failed(why) = &e.status {
+            failed.push(format!("{}: {why}", e.key));
+        }
+    })
+    .await;
+    let lookup = |kind: Kind, slug: &str| match local(kind, slug) {
+        Known::Missing => crate::db::known(&tmp, component_type(kind), slug),
+        known => known,
+    };
+    let out = pulled.map(|_| suggest(inv, existing, Some(&lookup)));
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok((out?, failed))
 }
 
 fn describe(known: Option<Known>) -> String {

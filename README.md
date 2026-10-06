@@ -198,6 +198,10 @@ candidate the database tracks becomes an active line; everything else stays
 commented out with the reason. Components with no candidate at all are listed
 too, so custom code is never silently assumed covered.
 
+Add `--online` to ask the API about slugs the local database does not have
+(politely, 4 at a time). The answers go to a temporary directory that is
+deleted afterwards, so `--db` is never modified.
+
 With `--aliases` the inventory records each component's `lookup_slug` (and
 `lookup_type` for the `{ theme = ... }` form), and the list output uses the
 lookup slug with a comment naming the installed folder. Matches found through

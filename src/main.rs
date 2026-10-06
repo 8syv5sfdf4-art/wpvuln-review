@@ -104,6 +104,14 @@ enum AliasesCommand {
         /// Existing aliases file; components it already maps are skipped
         #[arg(long, env = "WPVULN_ALIASES", value_name = "FILE")]
         aliases: Option<PathBuf>,
+
+        /// Ask the API about slugs the local database lacks (nothing is saved)
+        #[arg(long)]
+        online: bool,
+
+        /// WPVulnerability API base URL, for --online
+        #[arg(long, env = "WPVULN_API", value_name = "URL", default_value = WPVULN_API)]
+        api_url: String,
     },
 }
 
@@ -244,7 +252,7 @@ async fn main() -> ExitCode {
     let result = match args.command {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
         Some(Command::Inventory(ref inv)) => run_inventory(inv),
-        Some(Command::Aliases(ref cmd)) => run_aliases(cmd),
+        Some(Command::Aliases(ref cmd)) => run_aliases(cmd).await,
         None => {
             // Print banner for human output
             if matches!(args.output_format, OutputFormatArg::Human) {
@@ -722,11 +730,13 @@ fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<E
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_aliases(cmd: &AliasesCommand) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+async fn run_aliases(cmd: &AliasesCommand) -> wordpress_vulnerable_scanner::Result<ExitCode> {
     let AliasesCommand::Suggest {
         input,
         db: db_dir,
         aliases,
+        online,
+        api_url,
     } = cmd;
     let inv = inventory::load(input)?;
     let existing = match aliases {
@@ -744,17 +754,48 @@ fn run_aliases(cmd: &AliasesCommand) -> wordpress_vulnerable_scanner::Result<Exi
         Some(_) => Some(&lookup),
         None => None,
     };
-    let suggestions = wordpress_vulnerable_scanner::aliases::suggest(&inv, &existing, known);
-    let checked = match db_dir {
-        Some(dir) => format!("local database {}", dir.display()),
-        None => "nothing (add --db DIR to confirm them)".to_string(),
+    let s = Style::stderr();
+    let (suggestions, failed) = if *online {
+        eprintln!(
+            "{} candidates at {api_url} (4 requests at a time, nothing is saved)",
+            s.bold("Checking")
+        );
+        let opts = PullOptions {
+            api_url: api_url.clone(),
+            ..PullOptions::default()
+        };
+        wordpress_vulnerable_scanner::aliases::suggest_online(
+            &inv,
+            &existing,
+            db_dir.as_deref(),
+            &opts,
+        )
+        .await?
+    } else {
+        let found = wordpress_vulnerable_scanner::aliases::suggest(&inv, &existing, known);
+        (found, Vec::new())
+    };
+    let checked = match (db_dir, online) {
+        (Some(dir), true) => format!("local database {}, then {api_url}", dir.display()),
+        (None, true) => api_url.clone(),
+        (Some(dir), false) => format!("local database {}", dir.display()),
+        (None, false) => "nothing (add --db DIR or --online to confirm them)".to_string(),
     };
     print!(
         "{}",
         wordpress_vulnerable_scanner::aliases::render(&suggestions, &checked)
     );
 
-    let s = Style::stderr();
+    if !failed.is_empty() {
+        eprintln!(
+            "{} {} lookup{} failed, so those slugs read as \"not in the database\"; run again \
+             to retry: {}",
+            s.yellow("warning:"),
+            failed.len(),
+            if failed.len() == 1 { "" } else { "s" },
+            failed.join(", ")
+        );
+    }
     let confirmed = suggestions.iter().filter(|x| x.chosen.is_some()).count();
     let without = suggestions
         .iter()
