@@ -226,7 +226,7 @@ impl Default for Analyzer {
 }
 
 /// Get current timestamp in ISO format (lightweight, no chrono dependency)
-fn chrono_lite_now() -> String {
+pub(crate) fn chrono_lite_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let duration = SystemTime::now()
