@@ -212,17 +212,23 @@ impl Inventory {
 }
 
 /// Take an inventory of a WordPress root, a `wp-content` directory or a
-/// plugins directory
+/// plugins directory, either on disk or inside a `.tar`, `.tar.gz`/`.tgz`
+/// or `.zip` file. Archives are read in place, never extracted.
 pub fn read(path: &Path) -> Result<Inventory> {
-    if !path.is_dir() {
-        return Err(Error::Inventory(format!(
-            "{}: not a directory",
-            path.display()
-        )));
-    }
-    let mut tree = FsTree::new(path)?;
-    let mut inv = walk(&mut tree)?;
+    let (mut inv, kind) = if path.is_dir() {
+        (walk(&mut FsTree::new(path)?)?, SourceKind::Directory)
+    } else if path.is_file() {
+        let mut warnings = Vec::new();
+        let mut tree = ArchiveTree::open(path, &mut warnings)?;
+        let mut inv = walk(&mut tree)?;
+        warnings.append(&mut inv.warnings);
+        inv.warnings = warnings;
+        (inv, SourceKind::Archive)
+    } else {
+        return Err(Error::Inventory(format!("{}: not found", path.display())));
+    };
     inv.source.path = path.display().to_string();
+    inv.source.kind = kind;
     Ok(inv)
 }
 
@@ -396,6 +402,332 @@ impl Tree for FsTree {
     }
 }
 
+/// Most entries an archive may have
+pub const MAX_ARCHIVE_ENTRIES: usize = 500_000;
+
+/// Most uncompressed bytes a tar archive may declare (it is streamed twice)
+pub const MAX_ARCHIVE_BYTES: u64 = 16 << 30;
+
+#[derive(Debug, Clone, Copy)]
+enum ArchiveFormat {
+    Tar,
+    TarGz,
+    Zip,
+}
+
+/// The structure of an archive, read without extracting it. File heads
+/// are loaded on demand: tar archives are streamed again, zip entries are
+/// read directly.
+struct ArchiveTree {
+    path: PathBuf,
+    format: ArchiveFormat,
+    /// Directory -> its entries (name -> is_dir)
+    dirs: HashMap<String, std::collections::BTreeMap<String, bool>>,
+    /// Zip entry index for each file path
+    zip_index: HashMap<String, usize>,
+}
+
+/// Why an archive entry was skipped
+enum Skip {
+    Unsafe,
+    NotUtf8,
+    Link,
+}
+
+/// A safe relative path for an archive entry: `\` counts as a separator,
+/// `.` and empty parts are dropped, and absolute paths, drive letters and
+/// `..` are refused. `Some("")` is the archive root.
+fn clean_entry_path(raw: &[u8]) -> std::result::Result<String, Skip> {
+    let s = std::str::from_utf8(raw).map_err(|_| Skip::NotUtf8)?;
+    let s = s.replace('\\', "/");
+    if s.starts_with('/') || s.as_bytes().get(1) == Some(&b':') {
+        return Err(Skip::Unsafe);
+    }
+    let mut parts = Vec::new();
+    for part in s.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err(Skip::Unsafe),
+            p => parts.push(p),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+impl ArchiveTree {
+    fn open(path: &Path, warnings: &mut Vec<String>) -> Result<Self> {
+        let err = |e: &dyn std::fmt::Display| Error::Inventory(format!("{}: {e}", path.display()));
+        let mut magic = [0u8; 512];
+        let mut f = std::fs::File::open(path).map_err(|e| err(&e))?;
+        let n = read_up_to(&mut f, &mut magic).map_err(|e| err(&e))?;
+        let magic = &magic[..n];
+        let format = if magic.starts_with(&[0x1f, 0x8b]) {
+            ArchiveFormat::TarGz
+        } else if magic.starts_with(b"PK\x03\x04") || magic.starts_with(b"PK\x05\x06") {
+            ArchiveFormat::Zip
+        } else if is_tar_header(magic) {
+            ArchiveFormat::Tar
+        } else {
+            return Err(err(&"not a directory, .tar, .tar.gz or .zip file"));
+        };
+        let mut tree = Self {
+            path: path.to_path_buf(),
+            format,
+            dirs: HashMap::new(),
+            zip_index: HashMap::new(),
+        };
+        let mut skipped: Vec<(Skip, String)> = Vec::new();
+        match format {
+            ArchiveFormat::Zip => {
+                let mut zip = zip::ZipArchive::new(f).map_err(|e| err(&e))?;
+                if zip.len() > MAX_ARCHIVE_ENTRIES {
+                    return Err(err(&format!(
+                        "more than {MAX_ARCHIVE_ENTRIES} entries, refusing to read"
+                    )));
+                }
+                for i in 0..zip.len() {
+                    let entry = zip.by_index_raw(i).map_err(|e| err(&e))?;
+                    let raw = entry.name_raw().to_vec();
+                    let (is_dir, is_link) = (entry.is_dir(), entry.is_symlink());
+                    drop(entry);
+                    tree.add(i, &raw, is_dir, is_link, &mut skipped);
+                }
+            }
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => {
+                let mut archive = tar::Archive::new(tree.tar_reader()?);
+                let (mut count, mut bytes) = (0usize, 0u64);
+                for entry in archive.entries().map_err(|e| err(&e))? {
+                    let entry = entry.map_err(|e| err(&e))?;
+                    count += 1;
+                    bytes = bytes.saturating_add(entry.size());
+                    if count > MAX_ARCHIVE_ENTRIES || bytes > MAX_ARCHIVE_BYTES {
+                        return Err(err(&format!(
+                            "more than {MAX_ARCHIVE_ENTRIES} entries or {} GiB, refusing to read",
+                            MAX_ARCHIVE_BYTES >> 30
+                        )));
+                    }
+                    use tar::EntryType as T;
+                    let (is_dir, is_link) = match entry.header().entry_type() {
+                        T::Regular | T::Continuous => (false, false),
+                        T::Directory => (true, false),
+                        T::Symlink | T::Link => (false, true),
+                        _ => continue,
+                    };
+                    tree.add(count, &entry.path_bytes(), is_dir, is_link, &mut skipped);
+                }
+            }
+        }
+        for (what, label) in [
+            (Skip::Unsafe, "with unsafe paths (absolute or ..)"),
+            (Skip::NotUtf8, "with non-UTF-8 names"),
+            (Skip::Link, "that are links"),
+        ] {
+            let hits: Vec<&String> = skipped
+                .iter()
+                .filter(|(s, _)| std::mem::discriminant(s) == std::mem::discriminant(&what))
+                .map(|(_, p)| p)
+                .collect();
+            if let Some(first) = hits.first() {
+                warnings.push(format!(
+                    "{}: skipped {} entr{} {label}, e.g. {first}",
+                    path.display(),
+                    hits.len(),
+                    if hits.len() == 1 { "y" } else { "ies" }
+                ));
+            }
+        }
+        Ok(tree)
+    }
+
+    fn tar_reader(&self) -> Result<Box<dyn Read>> {
+        let f = std::fs::File::open(&self.path)
+            .map_err(|e| Error::Inventory(format!("{}: {e}", self.path.display())))?;
+        let f = std::io::BufReader::new(f);
+        Ok(match self.format {
+            ArchiveFormat::TarGz => Box::new(flate2::read::MultiGzDecoder::new(f)),
+            _ => Box::new(f),
+        })
+    }
+
+    /// Record one entry and all its parent directories
+    fn add(
+        &mut self,
+        index: usize,
+        raw: &[u8],
+        is_dir: bool,
+        is_link: bool,
+        skipped: &mut Vec<(Skip, String)>,
+    ) {
+        let shown = || String::from_utf8_lossy(raw).into_owned();
+        let path = match clean_entry_path(raw) {
+            Ok(p) if p.is_empty() => return,
+            Ok(_) if is_link => return skipped.push((Skip::Link, shown())),
+            Ok(p) => p,
+            Err(why) => return skipped.push((why, shown())),
+        };
+        if !is_dir {
+            self.zip_index.insert(path.clone(), index);
+        }
+        let mut child = path.as_str();
+        let mut child_is_dir = is_dir;
+        loop {
+            let (parent, name) = child.rsplit_once('/').unwrap_or(("", child));
+            let entries = self.dirs.entry(parent.to_string()).or_default();
+            let known = entries.insert(name.to_string(), child_is_dir).is_some();
+            if parent.is_empty() || (known && child_is_dir) {
+                break;
+            }
+            child = parent;
+            child_is_dir = true;
+        }
+    }
+}
+
+/// Is this a tar header block? Old v7 archives have no `ustar` magic, so
+/// check the header checksum (the sum of all bytes, with the checksum
+/// field itself counted as spaces).
+fn is_tar_header(block: &[u8]) -> bool {
+    let Some(block) = block.get(..512) else {
+        return false;
+    };
+    let field = String::from_utf8_lossy(&block[148..156]);
+    let Ok(stored) = u32::from_str_radix(field.trim_matches([' ', '\0']), 8) else {
+        return false;
+    };
+    let sum: u32 = block
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                b as u32
+            }
+        })
+        .sum();
+    stored == sum
+}
+
+/// Fill `buf` as far as the reader allows
+fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+impl Tree for ArchiveTree {
+    fn list(&mut self, dir: &str, _warnings: &mut Vec<String>) -> Vec<Entry> {
+        self.dirs
+            .get(dir)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(name, &is_dir)| Entry {
+                        name: name.clone(),
+                        is_dir,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn heads(&mut self, paths: &[String], warnings: &mut Vec<String>) -> HashMap<String, Vec<u8>> {
+        let mut out = HashMap::new();
+        let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let fail = |warnings: &mut Vec<String>, e: &dyn std::fmt::Display| {
+            warnings.push(format!("{}: {e}", self.path.display()));
+        };
+        match self.format {
+            ArchiveFormat::Zip => {
+                let f = match std::fs::File::open(&self.path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        fail(warnings, &e);
+                        return out;
+                    }
+                };
+                let mut zip = match zip::ZipArchive::new(f) {
+                    Ok(z) => z,
+                    Err(e) => {
+                        fail(warnings, &e);
+                        return out;
+                    }
+                };
+                for p in paths {
+                    let Some(&i) = self.zip_index.get(p) else {
+                        continue;
+                    };
+                    let mut buf = Vec::new();
+                    match zip
+                        .by_index(i)
+                        .map_err(std::io::Error::other)
+                        .and_then(|f| f.take(HEAD_LEN as u64).read_to_end(&mut buf))
+                    {
+                        Ok(_) => {
+                            out.insert(p.clone(), buf);
+                        }
+                        Err(e) => warnings.push(format!("{p}: unreadable ({e})")),
+                    }
+                }
+            }
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => {
+                let reader = match self.tar_reader() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        fail(warnings, &e);
+                        return out;
+                    }
+                };
+                let mut archive = tar::Archive::new(reader);
+                let entries = match archive.entries() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        fail(warnings, &e);
+                        return out;
+                    }
+                };
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            fail(warnings, &e);
+                            break;
+                        }
+                    };
+                    if !matches!(
+                        entry.header().entry_type(),
+                        tar::EntryType::Regular | tar::EntryType::Continuous
+                    ) {
+                        continue;
+                    }
+                    let Ok(path) = clean_entry_path(&entry.path_bytes()) else {
+                        continue;
+                    };
+                    if !wanted.contains(path.as_str()) {
+                        continue;
+                    }
+                    let mut buf = Vec::new();
+                    match entry.take(HEAD_LEN as u64).read_to_end(&mut buf) {
+                        Ok(_) => {
+                            out.insert(path, buf);
+                        }
+                        Err(e) => warnings.push(format!("{path}: unreadable ({e})")),
+                    }
+                    if out.len() == wanted.len() {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Find what the tree holds. A single wrapper folder (as archives often
 /// have) is descended into, unless it looks like a plugin itself.
 fn detect(tree: &mut impl Tree, warnings: &mut Vec<String>) -> (Layout, String) {
@@ -426,11 +758,13 @@ fn detect(tree: &mut impl Tree, warnings: &mut Vec<String>) -> (Layout, String) 
             && only.is_dir
         {
             let child = join(&base, &only.name);
-            let looks_like_plugin = tree
-                .list(&child, warnings)
-                .iter()
-                .any(|e| !e.is_dir && e.name.ends_with(".php") && e.name != "index.php");
-            if !looks_like_plugin {
+            let known = only.name == "plugins" || only.name == "wp-content";
+            if known
+                || !tree
+                    .list(&child, warnings)
+                    .iter()
+                    .any(|e| !e.is_dir && e.name.ends_with(".php") && e.name != "index.php")
+            {
                 base = child;
                 continue;
             }

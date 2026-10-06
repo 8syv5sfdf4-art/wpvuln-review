@@ -8,7 +8,7 @@
 //! - Queries WPVulnerability API for known CVEs
 //! - Supports multiple input modes: URL, direct component list, list file, or JSON manifest
 //! - Can pull records into a local database and scan fully offline ([`db`])
-//! - Lists installed plugins, themes and core from an installation directory ([`inventory`])
+//! - Lists installed plugins, themes and core from a directory or an archive ([`inventory`])
 //! - Outputs results in human-readable or JSON format
 //!
 //! # Example

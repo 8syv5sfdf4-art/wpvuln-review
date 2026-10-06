@@ -264,3 +264,143 @@ fn symlinks_stay_inside_the_tree() {
 fn rejects_a_missing_path() {
     assert!(inventory::read(Path::new("/nonexistent/wp")).is_err());
 }
+
+/// Every file under `root`, as (relative path, bytes), sorted
+fn files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The fixture as `site/<files>` in a .tar.gz
+fn fixture_tar_gz(dest: &Path) {
+    let gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(dest).unwrap(),
+        flate2::Compression::fast(),
+    );
+    let mut tar = tar::Builder::new(gz);
+    for (rel, bytes) in files(&fixture()) {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(bytes.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, format!("site/{rel}"), bytes.as_slice())
+            .unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap();
+}
+
+/// The fixture as `site/<files>` in a .zip, with macOS litter
+fn fixture_zip(dest: &Path) {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(dest).unwrap());
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.add_directory("__MACOSX/site/", opts).unwrap();
+    zip.start_file("__MACOSX/site/._wp-includes", opts).unwrap();
+    for (rel, bytes) in files(&fixture()) {
+        zip.start_file(format!("site/{rel}"), opts).unwrap();
+        zip.write_all(&bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+#[test]
+fn archives_read_like_the_directory() {
+    let dir = temp_dir("archives");
+    let on_disk = inventory::read(&fixture()).unwrap();
+
+    for (name, build) in [
+        ("site.tar.gz", fixture_tar_gz as fn(&Path)),
+        ("site.zip", fixture_zip),
+    ] {
+        let path = dir.join(name);
+        build(&path);
+        let inv = inventory::read(&path).unwrap();
+        assert_eq!(inv.source.kind, inventory::SourceKind::Archive, "{name}");
+        assert_eq!(inv.source.layout, Layout::Wordpress, "{name}");
+        assert_eq!(inv.core.unwrap().version.as_deref(), Some("6.6.2"));
+        assert_eq!(inv.components, on_disk.components, "{name}");
+        let strip = |w: &String| w.trim_start_matches("site/").to_string();
+        let warnings: Vec<_> = inv.warnings.iter().map(strip).collect();
+        let expected: Vec<_> = on_disk.warnings.iter().map(strip).collect();
+        assert_eq!(warnings, expected, "{name}");
+    }
+}
+
+#[test]
+fn plain_tar_of_a_plugins_folder() {
+    let dir = temp_dir("plain-tar");
+    let path = dir.join("plugins.tar");
+    let mut tar = tar::Builder::new(std::fs::File::create(&path).unwrap());
+    tar.append_dir_all("plugins", fixture().join("wp-content/plugins"))
+        .unwrap();
+    tar.finish().unwrap();
+
+    let inv = inventory::read(&path).unwrap();
+    assert_eq!(inv.source.layout, Layout::Plugins);
+    let from_dir = inventory::read(&fixture().join("wp-content/plugins")).unwrap();
+    assert_eq!(inv.components, from_dir.components);
+}
+
+/// A tar entry with a raw name, bypassing the builder's path checks
+fn raw_entry(tar: &mut tar::Builder<std::fs::File>, name: &str, body: &[u8]) {
+    let mut h = tar::Header::new_old();
+    h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+    h.set_size(body.len() as u64);
+    h.set_mode(0o644);
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_cksum();
+    tar.append(&h, body).unwrap();
+}
+
+#[test]
+fn archive_paths_cannot_escape() {
+    let dir = temp_dir("evil");
+    let path = dir.join("evil.tar");
+    let header = b"<?php\n/*\nPlugin Name: Evil\nVersion: 6.6.6\n*/\n";
+    let mut tar = tar::Builder::new(std::fs::File::create(&path).unwrap());
+    raw_entry(
+        &mut tar,
+        "plugins/ok/ok.php",
+        b"<?php\n/*\nPlugin Name: Ok\nVersion: 1\n*/\n",
+    );
+    raw_entry(&mut tar, "plugins/../evil/evil.php", header);
+    raw_entry(&mut tar, "/plugins/abs/abs.php", header);
+    raw_entry(&mut tar, "C:\\plugins\\win\\win.php", header);
+    tar.finish().unwrap();
+    drop(tar);
+
+    let inv = inventory::read(&path).unwrap();
+    let slugs: Vec<_> = inv.components.iter().map(|c| c.slug.as_str()).collect();
+    assert_eq!(slugs, vec!["ok"]);
+    assert!(warned(&inv, "skipped 3 entries with unsafe paths"));
+}
+
+#[test]
+fn rejects_unknown_file_types() {
+    let dir = temp_dir("not-archive");
+    let path = dir.join("plugins.rar");
+    std::fs::write(&path, b"Rar!\x1a\x07\x00 not supported").unwrap();
+    let err = inventory::read(&path).unwrap_err().to_string();
+    assert!(
+        err.contains("not a directory, .tar, .tar.gz or .zip"),
+        "{err}"
+    );
+}

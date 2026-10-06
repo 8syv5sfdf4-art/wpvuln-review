@@ -45,6 +45,11 @@ regex = "1"
 # Version comparison
 semver = "1"
 
+# Archives, read in place by `inventory`
+tar = "0.4.46"
+flate2 = "1.1.10"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
