@@ -233,7 +233,18 @@ fn warn_missing(dir: &Path, components: &[ComponentInfo]) {
         ComponentType::Core => c.version.as_deref().map(|v| (c.component_type, v)),
         _ => Some((c.component_type, c.slug.as_str())),
     });
-    let missing = db::missing(dir, keys);
+    let keys: Vec<_> = keys.collect();
+    let untracked = db::untracked(dir, keys.iter().copied());
+    if !untracked.is_empty() {
+        let s = Style::stderr();
+        eprintln!(
+            "{} {} not tracked by WPVulnerability, so not checked (common for premium/custom plugins): {}\n",
+            s.yellow("note:"),
+            untracked.len(),
+            untracked.join(", ")
+        );
+    }
+    let missing = db::missing(dir, keys.iter().copied());
     if !missing.is_empty() {
         let s = Style::stderr();
         eprintln!(
@@ -430,6 +441,13 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             println!("  plugins     {}", st.plugins);
             println!("  themes      {}", st.themes);
             println!("  core        {}", st.core);
+            if st.untracked > 0 {
+                println!(
+                    "  untracked   {} {}",
+                    st.untracked,
+                    s.dim("(no WPVulnerability entry, not checked)")
+                );
+            }
             println!("  records     {}", st.records);
             if let Some(t) = st.oldest {
                 println!("  oldest file {}", ago(t));
@@ -466,13 +484,16 @@ async fn pull_cli(
     let started = Instant::now();
     let summary = db::pull(dir, items, opts, |e: &PullEvent| {
         let (mark, detail) = match &e.status {
-            PullStatus::Saved(0) => (s.green("✓"), s.dim("no vulnerabilities")),
+            PullStatus::Saved(0) => (s.green("✓"), s.dim("tracked, no known vulnerabilities")),
             PullStatus::Saved(n) => (
                 s.green("✓"),
                 format!("{n} record{}", if *n == 1 { "" } else { "s" }),
             ),
             PullStatus::Fresh(n) => (s.dim("="), s.dim(&format!("{n} records, up to date"))),
-            PullStatus::NoData => (s.dim("·"), s.dim("not in WPVulnerability")),
+            PullStatus::NoData => (
+                s.yellow("?"),
+                s.yellow("not tracked by WPVulnerability (not checked)"),
+            ),
             PullStatus::Invalid => (s.red("✗"), s.red("invalid slug, skipped")),
             PullStatus::Failed(why) => (
                 s.red("✗"),
@@ -503,7 +524,7 @@ async fn pull_cli(
         parts.push(format!("{} up to date", summary.fresh));
     }
     if summary.no_data > 0 {
-        parts.push(format!("{} not in WPVulnerability", summary.no_data));
+        parts.push(s.yellow(&format!("{} not tracked", summary.no_data)));
     }
     if summary.invalid > 0 {
         parts.push(s.red(&format!("{} invalid", summary.invalid)));

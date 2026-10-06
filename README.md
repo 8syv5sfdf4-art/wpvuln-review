@@ -143,8 +143,10 @@ and:
 - retries timeouts, HTTP 429 and 5xx, and keeps going when one component fails;
   re-run the same command to retry only what's missing
 - skips records newer than `--max-age <hours>`
-- stores components the API has no data for as empty records, so offline scans
-  can tell "checked, nothing known" from "never pulled"
+- tells three cases apart: tracked with vulnerabilities, tracked with none, and
+  **not tracked** (WPVulnerability has no entry, common for premium and custom
+  plugins). Not-tracked components are stored too, and offline scans list them
+  as "not checked" rather than letting them look clean
 
 Each record is the raw API response, one file per component:
 
@@ -156,8 +158,8 @@ wpvuln-db/
 └── core/<version>.json
 ```
 
-A component missing from the database is reported as clean, so a scan with
-`--db` prints a warning listing those components. `--db` and `--api-url`
+A scan with `--db` prints a note for components that are not tracked and a
+warning for components that were never pulled, since neither has been checked. `--db` and `--api-url`
 (for a self-hosted mirror) can also be set with `WPVULN_DB` and `WPVULN_API`.
 
 ## Output Formats

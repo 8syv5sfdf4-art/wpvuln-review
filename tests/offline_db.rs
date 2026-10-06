@@ -102,6 +102,7 @@ async fn pull_continues_past_empty_missing_and_failing_components() {
 
     let st = db::status(&dir).unwrap();
     assert_eq!(st.plugins, 4);
+    assert_eq!(st.untracked, 1, "the 404 is stored as untracked, not clean");
     assert_eq!(st.records, 2);
     assert_eq!(st.meta.unwrap().source, server.uri());
 }
@@ -177,4 +178,79 @@ async fn offline_analysis_reads_local_records() {
             .map(|c| (c.component_type, c.slug.as_str())),
     );
     assert_eq!(missing, vec!["never-pulled"]);
+}
+
+#[tokio::test]
+async fn untracked_is_not_the_same_as_clean() {
+    let server = MockServer::start().await;
+    // what WPVulnerability returns for slugs it doesn't know
+    mount(
+        &server,
+        "/plugin/woodmart-core/",
+        200,
+        r#"{"error":0,"message":null,"data":null}"#,
+    )
+    .await;
+    mount(
+        &server,
+        "/plugin/zhaket-woo-sep/",
+        200,
+        r#"{"error":0,"message":null,"data":{"name":null,"plugin":null,"vulnerability":null}}"#,
+    )
+    .await;
+    // a known plugin with no vulnerabilities
+    mount(
+        &server,
+        "/plugin/wp-crontrol/",
+        200,
+        r#"{"error":0,"message":null,"data":{"name":"WP Crontrol","vulnerability":null}}"#,
+    )
+    .await;
+
+    let dir = temp_db("untracked");
+    let slugs = ["woodmart-core", "zhaket-woo-sep", "wp-crontrol"];
+    let items: Vec<_> = slugs
+        .iter()
+        .map(|s| (ComponentType::Plugin, s.to_string()))
+        .collect();
+    let mut events = Vec::new();
+    let summary = db::pull(&dir, &items, &opts(&server), |e| {
+        events.push((e.key.clone(), e.status.clone()))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(summary.no_data, 2);
+    assert_eq!(summary.saved, 1);
+    assert!(events.contains(&("woodmart-core".into(), PullStatus::NoData)));
+    assert!(events.contains(&("zhaket-woo-sep".into(), PullStatus::NoData)));
+    assert!(events.contains(&("wp-crontrol".into(), PullStatus::Saved(0))));
+
+    let keys = slugs.iter().map(|s| (ComponentType::Plugin, *s));
+    assert_eq!(
+        db::untracked(&dir, keys),
+        vec!["woodmart-core", "zhaket-woo-sep"]
+    );
+    let st = db::status(&dir).unwrap();
+    assert_eq!((st.plugins, st.untracked, st.records), (3, 2, 0));
+
+    // a re-pull within max_age keeps them untracked without re-downloading
+    drop(server);
+    let fresh = PullOptions {
+        api_url: "http://127.0.0.1:9".into(),
+        max_age: Some(Duration::from_secs(3600)),
+        ..opts_offline()
+    };
+    let again = db::pull(&dir, &items, &fresh, |_| {}).await.unwrap();
+    assert_eq!((again.no_data, again.fresh, again.failed), (2, 1, 0));
+}
+
+fn opts_offline() -> PullOptions {
+    PullOptions {
+        api_url: String::new(),
+        jobs: 2,
+        attempts: 1,
+        delay: Duration::ZERO,
+        max_age: None,
+    }
 }

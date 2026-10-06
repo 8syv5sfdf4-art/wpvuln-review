@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::http::USER_AGENT;
 use crate::scanner::ComponentType;
-use crate::vulnerability::{api_url, record_count};
+use crate::vulnerability::{RecordKind, api_url, record_kind};
 
 /// Database layout version, bumped on incompatible changes
 pub const FORMAT_VERSION: u32 = 1;
@@ -100,8 +100,9 @@ pub enum PullStatus {
     Saved(usize),
     /// Already present and fresh enough (see [`PullOptions::max_age`])
     Fresh(usize),
-    /// The API has no data for it (404 or an API-level error); an empty
-    /// record is stored so offline scans know it was checked
+    /// WPVulnerability has no entry for it (404, an API error, or
+    /// `data: null`). Common for premium and custom plugins. The response is
+    /// stored so offline scans can say "not tracked" instead of "clean"
     NoData,
     /// The slug or version contains characters that are not allowed
     Invalid,
@@ -141,7 +142,8 @@ pub struct PullSummary {
     pub records: usize,
 }
 
-const EMPTY_RECORD: &str = r#"{"error":0,"message":null,"data":{"vulnerability":[]}}"#;
+/// Stored for a 404, so the file reads as "not tracked" rather than "clean"
+const UNTRACKED_RECORD: &str = r#"{"error":0,"message":null,"data":null}"#;
 
 /// Download records for `items` into `dir`.
 ///
@@ -242,12 +244,15 @@ async fn pull_one(
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age < max_age)
-        && let Some(n) = std::fs::read_to_string(&path)
+        && let Some(kind) = std::fs::read_to_string(&path)
             .ok()
             .as_deref()
-            .and_then(record_count)
+            .and_then(record_kind)
     {
-        return PullStatus::Fresh(n);
+        return match kind {
+            RecordKind::Tracked(n) => PullStatus::Fresh(n),
+            RecordKind::Untracked => PullStatus::NoData,
+        };
     }
 
     let url = api_url(base, kind, key);
@@ -267,7 +272,7 @@ async fn pull_one(
         };
         let code = response.status();
         if code == StatusCode::NOT_FOUND {
-            return save(&path, EMPTY_RECORD, PullStatus::NoData);
+            return save(&path, UNTRACKED_RECORD, PullStatus::NoData);
         }
         if code == StatusCode::TOO_MANY_REQUESTS || code.is_server_error() {
             last_error = format!("HTTP {}", code.as_u16());
@@ -283,15 +288,14 @@ async fn pull_one(
                 continue;
             }
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
-            last_error = "response is not JSON (blocked or rate limited?)".to_string();
-            continue;
+        return match record_kind(&body) {
+            Some(RecordKind::Tracked(n)) => save(&path, &body, PullStatus::Saved(n)),
+            Some(RecordKind::Untracked) => save(&path, &body, PullStatus::NoData),
+            None => {
+                last_error = "unexpected response (blocked or rate limited?)".to_string();
+                continue;
+            }
         };
-        if value.get("error").and_then(|e| e.as_i64()).unwrap_or(0) != 0 {
-            return save(&path, EMPTY_RECORD, PullStatus::NoData);
-        }
-        let n = record_count(&body).unwrap_or(0);
-        return save(&path, &body, PullStatus::Saved(n));
     }
     PullStatus::Failed(last_error)
 }
@@ -343,6 +347,8 @@ pub struct DbStatus {
     pub themes: usize,
     /// Stored core records
     pub core: usize,
+    /// Of those, components WPVulnerability has no entry for (not checked)
+    pub untracked: usize,
     /// Total vulnerability records across all files
     pub records: usize,
     /// Unix time of the oldest record file
@@ -375,11 +381,14 @@ pub fn status(dir: &Path) -> Result<DbStatus> {
                 ComponentType::Plugin => st.plugins += 1,
                 ComponentType::Theme => st.themes += 1,
             }
-            st.records += std::fs::read_to_string(&path)
+            match std::fs::read_to_string(&path)
                 .ok()
                 .as_deref()
-                .and_then(record_count)
-                .unwrap_or(0);
+                .and_then(record_kind)
+            {
+                Some(RecordKind::Tracked(n)) => st.records += n,
+                Some(RecordKind::Untracked) | None => st.untracked += 1,
+            }
             if let Some(t) = entry
                 .metadata()
                 .ok()
@@ -402,6 +411,24 @@ pub fn missing<'a>(
     items
         .into_iter()
         .filter(|(kind, key)| !record_path(dir, *kind, key).is_some_and(|p| p.is_file()))
+        .map(|(_, key)| key)
+        .collect()
+}
+
+/// Components from `items` whose stored record says WPVulnerability has no
+/// entry for them: they were looked up, but nothing could be checked
+pub fn untracked<'a>(
+    dir: &Path,
+    items: impl IntoIterator<Item = (ComponentType, &'a str)>,
+) -> Vec<&'a str> {
+    items
+        .into_iter()
+        .filter(|(kind, key)| {
+            record_path(dir, *kind, key)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|b| record_kind(&b))
+                == Some(RecordKind::Untracked)
+        })
         .map(|(_, key)| key)
         .collect()
 }
