@@ -98,3 +98,70 @@ fn load_names_the_file_in_errors() {
     assert!(err.contains("aliases.toml: [plugin] \"x\""), "{err}");
     assert!(Aliases::load(&dir.join("missing.toml")).is_err());
 }
+
+#[test]
+fn applied_aliases_shape_the_list_output() {
+    let mut inv = fixture();
+    Aliases::parse(ALIASES).unwrap().apply(&mut inv);
+
+    let chaty = find(&inv, Kind::Plugin, "chaty-pro2");
+    assert_eq!(chaty.lookup_slug.as_deref(), Some("chaty"));
+    assert_eq!(chaty.lookup_type, None);
+    let hello = find(&inv, Kind::Plugin, "hello");
+    assert_eq!(hello.lookup_slug.as_deref(), Some("storefront"));
+    assert_eq!(hello.lookup_type, Some(Kind::Theme));
+    assert_eq!(find(&inv, Kind::Plugin, "akismet").lookup_slug, None);
+    assert!(
+        inv.warnings
+            .iter()
+            .any(|w| w.starts_with("aliases [plugin] \"gone-plugin\""))
+    );
+
+    let list = inv.to_list(wordpress_vulnerable_scanner::ComponentType::Plugin);
+    assert!(list.contains(
+        "# chaty-pro2 checked as \"chaty\" through an alias; premium editions may number versions differently\nchaty:3.3.6\n"
+    ), "{list}");
+    assert!(list.contains("# hello: covered by the check of theme \"storefront\" (alias)\n"));
+    assert!(
+        !list
+            .lines()
+            .any(|l| l.starts_with("hello") || l.starts_with("storefront"))
+    );
+    assert!(list.contains(
+        "# not loaded by WordPress, but on disk: Old Plugins/akismet-old/akismet.php\n# akismet-old checked as \"akismet\" through an alias; premium editions may number versions differently\nakismet:4.0\n"
+    ));
+    let themes = inv.to_list(wordpress_vulnerable_scanner::ComponentType::Theme);
+    assert!(themes.contains("# storefront-child checked as \"storefront\" through an alias; premium editions may number versions differently\nstorefront:1.0.0\n"));
+}
+
+#[test]
+fn cli_inventory_takes_an_aliases_file() {
+    let dir = std::env::temp_dir().join(format!("wvs-aliases-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("aliases.toml");
+    std::fs::write(&path, ALIASES).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["inventory", "--format", "list", "--aliases"])
+        .arg(&path)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wp"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stdout.contains("\nchaty:3.3.6\n"), "{stdout}");
+    assert!(
+        stderr.contains("aliases [plugin] \"gone-plugin\""),
+        "{stderr}"
+    );
+
+    std::fs::write(&path, "[plugin]\n\"x\" = \"../x\"\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["inventory", "--aliases"])
+        .arg(&path)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wp"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a valid slug"));
+}

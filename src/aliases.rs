@@ -136,6 +136,26 @@ impl Aliases {
         })
     }
 
+    /// Record each component's alias in the inventory (`lookup_slug`, and
+    /// `lookup_type` for a cross-type alias) and add [`Aliases::check`]
+    /// warnings, so the inventory alone says what will be looked up
+    pub fn apply(&self, inv: &mut Inventory) {
+        let mut warnings = self.check(inv);
+        for c in &mut inv.components {
+            let Some(target) = self.target(c.kind, &c.slug) else {
+                continue;
+            };
+            c.lookup_slug = Some(target.slug.clone());
+            let own = if c.kind == Kind::Theme {
+                Kind::Theme
+            } else {
+                Kind::Plugin
+            };
+            c.lookup_type = (target.kind != own).then_some(target.kind);
+        }
+        inv.warnings.append(&mut warnings);
+    }
+
     /// Entries that cannot do what they say, as explained warnings
     pub fn check(&self, inv: &Inventory) -> Vec<String> {
         let mut warnings = Vec::new();

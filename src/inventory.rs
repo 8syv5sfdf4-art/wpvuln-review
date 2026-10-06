@@ -180,9 +180,14 @@ pub struct Component {
     /// Available update reported by WP-CLI
     #[serde(default)]
     pub update_version: Option<String>,
-    /// Slug to look up in vulnerability data, when it differs from `slug`
+    /// Slug to look up in vulnerability data, set from an aliases file
+    /// when it differs from `slug`
     #[serde(default)]
     pub lookup_slug: Option<String>,
+    /// Set when the alias points at another kind, such as a plugin that
+    /// ships with a theme and is covered by the theme's check
+    #[serde(default)]
+    pub lookup_type: Option<Kind>,
     /// Where `version` came from; `None` when there is no version
     #[serde(default)]
     pub version_source: Option<VersionSource>,
@@ -224,13 +229,37 @@ impl Inventory {
                     c.main_file
                 ));
             }
-            if !crate::db::is_safe_key(&c.slug) {
-                out.push_str(&format!("# skipped {:?}: not a valid slug\n", c.slug));
+            if let Some(other) = c.lookup_type.filter(|t| *t != c.kind) {
+                let what = if other == Kind::Theme {
+                    "theme"
+                } else {
+                    "plugin"
+                };
+                out.push_str(&format!(
+                    "# {}: covered by the check of {what} \"{}\" (alias)\n",
+                    c.slug,
+                    c.lookup_slug.as_deref().unwrap_or_default()
+                ));
+                continue;
+            }
+            let slug = match c.lookup_slug {
+                Some(ref lookup) => {
+                    out.push_str(&format!(
+                        "# {} checked as \"{lookup}\" through an alias; premium editions may \
+                         number versions differently\n",
+                        c.slug
+                    ));
+                    lookup
+                }
+                None => &c.slug,
+            };
+            if !crate::db::is_safe_key(slug) {
+                out.push_str(&format!("# skipped {slug:?}: not a valid slug\n"));
                 continue;
             }
             match &c.version {
-                Some(v) => out.push_str(&format!("{}:{}\n", c.slug, v)),
-                None => out.push_str(&format!("{}\n", c.slug)),
+                Some(v) => out.push_str(&format!("{slug}:{v}\n")),
+                None => out.push_str(&format!("{slug}\n")),
             }
         }
         out
@@ -1323,6 +1352,7 @@ fn component(
         status: None,
         update_version: None,
         lookup_slug: None,
+        lookup_type: None,
         version_source: h.get("Version").map(|_| VersionSource::Header),
     }
 }

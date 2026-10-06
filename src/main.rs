@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
+    aliases::Aliases,
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
     output::{OutputConfig, OutputFormat, output_analysis},
@@ -114,6 +115,10 @@ struct InventoryArgs {
     /// Pass --allow-root to WP-CLI
     #[arg(long, requires = "with_wp_cli")]
     allow_root: bool,
+
+    /// Map folder names to wordpress.org slugs (see `aliases suggest`)
+    #[arg(long, env = "WPVULN_ALIASES", value_name = "FILE")]
+    aliases: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -623,6 +628,9 @@ fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<E
             ..Default::default()
         };
         inventory::enrich_with_wp_cli(&mut inv, &wp);
+    }
+    if let Some(ref path) = args.aliases {
+        Aliases::load(path)?.apply(&mut inv);
     }
     let text = match args.format {
         InventoryFormat::Json => serde_json::to_string_pretty(&inv)? + "\n",
