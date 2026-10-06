@@ -183,6 +183,22 @@ pub struct Component {
     /// Slug to look up in vulnerability data, when it differs from `slug`
     #[serde(default)]
     pub lookup_slug: Option<String>,
+    /// Where `version` came from; `None` when there is no version
+    #[serde(default)]
+    pub version_source: Option<VersionSource>,
+}
+
+/// Where a component's version was read from
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionSource {
+    /// The `Version` header, as WordPress reads it
+    Header,
+    /// `Stable tag` in readme.txt, used only when the header is missing
+    Readme,
+    /// WP-CLI, for a component it lists that the files lacked
+    #[serde(rename = "wp-cli")]
+    WpCli,
 }
 
 impl Inventory {
@@ -837,12 +853,16 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
     let mut folders: Vec<(String, Vec<Entry>)> = Vec::new();
     let mut archives = Vec::new();
     let mut nested_files: Vec<(String, String, String)> = Vec::new(); // (folder, slug, file)
+    let mut readmes: HashMap<String, String> = HashMap::new(); // plugin dir -> readme.txt
     for e in tree.list(&plugins_dir, &mut warnings) {
         if e.name.starts_with('.') {
             continue;
         }
         if e.is_dir {
             let entries = tree.list(&join(&plugins_dir, &e.name), &mut warnings);
+            if let Some(r) = find_readme(&entries) {
+                readmes.insert(e.name.clone(), format!("{}/{r}", e.name));
+            }
             for f in &entries {
                 if !f.is_dir && !f.name.starts_with('.') && f.name.ends_with(".php") {
                     plugin_files.push((e.name.clone(), format!("{}/{}", e.name, f.name)));
@@ -858,7 +878,11 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
                     .filter(|f| f.is_dir && !f.name.starts_with('.'))
                 {
                     let sub_dir = format!("{}/{}", e.name, sub.name);
-                    for f in tree.list(&join(&plugins_dir, &sub_dir), &mut warnings) {
+                    let sub_entries = tree.list(&join(&plugins_dir, &sub_dir), &mut warnings);
+                    if let Some(r) = find_readme(&sub_entries) {
+                        readmes.insert(sub_dir.clone(), format!("{sub_dir}/{r}"));
+                    }
+                    for f in sub_entries {
                         if !f.is_dir && !f.name.starts_with('.') && f.name.ends_with(".php") {
                             nested_files.push((
                                 e.name.clone(),
@@ -930,6 +954,7 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         .iter()
         .map(|(_, f)| f)
         .chain(nested_files.iter().map(|(_, _, f)| f))
+        .chain(readmes.values())
         .map(|f| join(&plugins_dir, f))
         .collect();
     wanted.extend(
@@ -950,6 +975,11 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
     let head = |p: &str| heads.get(p).map(Vec::as_slice);
 
     let plugin_headers = Headers::new(&PLUGIN_HEADERS);
+    let readme_for = |file: &str| {
+        file.rsplit_once('/')
+            .and_then(|(dir, _)| readmes.get(dir))
+            .map(String::as_str)
+    };
     let mut components = Vec::new();
 
     // Plugins: every file with a Plugin Name header counts, as in get_plugins()
@@ -971,10 +1001,10 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         if file.contains('/') {
             found_in.entry(slug).or_default().push(file);
         }
-        if !h.contains_key("Version") {
-            warnings.push(no_version(&path, "plugin"));
-        }
-        components.push(component(Kind::Plugin, slug, name, file, &h));
+        let mut c = component(Kind::Plugin, slug, name, file, &h);
+        let readme = readme_for(file).map(|r| join(&plugins_dir, r));
+        settle_version(&mut c, &path, readme.as_deref(), &head, &mut warnings);
+        components.push(c);
     }
     // Plugin copies inside folders WordPress does not load
     let mut nested_in: HashMap<&str, Vec<String>> = HashMap::new();
@@ -985,17 +1015,15 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         let Some(name) = h.get("Plugin Name") else {
             continue;
         };
-        if !h.contains_key("Version") {
-            warnings.push(no_version(&path, "plugin"));
-        }
-        let version = h
-            .get("Version")
-            .map_or("no version".to_string(), |v| v.clone());
+        let mut c = component(Kind::Unloaded, slug, name, file, &h);
+        let readme = readme_for(file).map(|r| join(&plugins_dir, r));
+        settle_version(&mut c, &path, readme.as_deref(), &head, &mut warnings);
+        let version = c.version.as_deref().unwrap_or("no version");
         nested_in
             .entry(folder)
             .or_default()
             .push(format!("{slug} = {name} {version}"));
-        components.push(component(Kind::Unloaded, slug, name, file, &h));
+        components.push(c);
     }
 
     for (folder, entries) in &folders {
@@ -1144,12 +1172,59 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
 
 /// Warning for a plugin or theme without a usable version
 fn no_version(path: &str, what: &str) -> String {
+    let tried = if what == "plugin" {
+        "no Version header and no readme.txt Stable tag"
+    } else {
+        "no Version header"
+    };
     format!(
-        "{path}: no Version header, so the installed version is unknown. The scan cannot \
-         compare it with vulnerable version ranges and will list it as not checked. A {what} \
-         without a version is usually custom code: review it by hand, or look up the version \
-         in wp-admin."
+        "{path}: {tried}, so the installed version is unknown. The scan cannot compare it \
+         with vulnerable version ranges and will list it as not checked. A {what} without a \
+         version is usually custom code: review it by hand, or look up the version in wp-admin."
     )
+}
+
+/// `readme.txt` in a plugin folder, matched case-insensitively
+fn find_readme(entries: &[Entry]) -> Option<&str> {
+    entries
+        .iter()
+        .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case("readme.txt"))
+        .map(|e| e.name.as_str())
+}
+
+/// `Stable tag:` from a wordpress.org style readme.txt; `trunk` means none
+fn stable_tag(bytes: &[u8]) -> Option<String> {
+    let re = Regex::new(r"(?mi)^[ \t*=#]*Stable tag:[ \t]*([^\s]+)").expect("valid regex");
+    re.captures(&file_data(bytes))
+        .map(|c| c[1].to_string())
+        .filter(|v| !v.eq_ignore_ascii_case("trunk"))
+}
+
+/// Keep the header version; without one, fall back to readme.txt and say
+/// so, or warn that the version is unknown
+fn settle_version<'a>(
+    c: &mut Component,
+    path: &str,
+    readme: Option<&str>,
+    head: &impl Fn(&str) -> Option<&'a [u8]>,
+    warnings: &mut Vec<String>,
+) {
+    if c.version.is_some() {
+        return;
+    }
+    match readme.and_then(|r| head(r).and_then(stable_tag).map(|v| (r, v))) {
+        Some((readme, tag)) => {
+            warnings.push(format!(
+                "{path}: no Version header, so the version {tag} was taken from \"Stable tag\" \
+                 in {readme}. A readme usually matches the code it ships with, but it can be \
+                 edited separately, so confirm the version in wp-admin before acting on \
+                 findings for this plugin."
+            ));
+            c.version = Some(tag);
+            c.version_source = Some(VersionSource::Readme);
+        }
+        None => warnings.push(no_version(path, "plugin")),
+    }
 }
 
 /// Warning for a file whose headers could not be read
@@ -1206,6 +1281,7 @@ fn component(
         status: None,
         update_version: None,
         lookup_slug: None,
+        version_source: h.get("Version").map(|_| VersionSource::Header),
     }
 }
 
@@ -1300,6 +1376,7 @@ pub fn enrich_with_wp_cli(inv: &mut Inventory, wp: &WpCli) {
                         _ => Kind::Plugin,
                     };
                     let mut c = component(kind, &item.name, &item.name, "", &HashMap::new());
+                    c.version_source = version.as_ref().map(|_| VersionSource::WpCli);
                     c.version = version;
                     c.status = status;
                     c.update_version = update;

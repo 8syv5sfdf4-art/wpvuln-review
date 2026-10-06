@@ -88,7 +88,7 @@ fn reads_a_wordpress_root_like_wordpress_does() {
             (
                 Plugin,
                 "empty-version",
-                None,
+                Some("3.1.4"),
                 "empty-version/empty-version.php"
             ),
             (Plugin, "hello", Some("1.7.2"), "hello.php"),
@@ -148,6 +148,21 @@ fn keeps_header_details() {
         Some("storefront")
     );
     assert_eq!(find(&inv, "storefront").parent, None);
+
+    use inventory::VersionSource;
+    assert_eq!(
+        find(&inv, "akismet").version_source,
+        Some(VersionSource::Header)
+    );
+    assert_eq!(
+        find(&inv, "storefront").version_source,
+        Some(VersionSource::Header)
+    );
+    assert_eq!(
+        find(&inv, "empty-version").version_source,
+        Some(VersionSource::Readme)
+    );
+    assert_eq!(find(&inv, "edge-after").version_source, None);
 }
 
 #[test]
@@ -167,6 +182,15 @@ fn warns_instead_of_guessing() {
         "plugins/two-headers: 2 files have a Plugin Name header"
     ));
     assert!(warned(&inv, "themes/broken: no style.css"));
+    assert!(warned(
+        &inv,
+        "edge-after/edge-after.php: no Version header and no readme.txt Stable tag"
+    ));
+    assert!(warned(
+        &inv,
+        "empty-version/empty-version.php: no Version header, so the version 3.1.4 was taken \
+         from \"Stable tag\" in wp-content/plugins/empty-version/readme.txt"
+    ));
     assert!(warned(
         &inv,
         "plugins/leftover: no .php file at its top level (it holds images)"
@@ -412,7 +436,7 @@ fn archives_read_like_the_directory() {
         assert_eq!(inv.source.layout, Layout::Wordpress, "{name}");
         assert_eq!(inv.core.unwrap().version.as_deref(), Some("6.6.2"));
         assert_eq!(inv.components, on_disk.components, "{name}");
-        let strip = |w: &String| w.trim_start_matches("site/").to_string();
+        let strip = |w: &String| w.replace("site/", "");
         let warnings: Vec<_> = inv.warnings.iter().map(strip).collect();
         let expected: Vec<_> = on_disk.warnings.iter().map(strip).collect();
         assert_eq!(warnings, expected, "{name}");
@@ -571,6 +595,10 @@ fn wp_cli_adds_status_and_updates() {
         "chaty-pro2: files say version 3.3.6, WP-CLI says 3.3.5"
     ));
     assert_eq!(find(&inv, "ghost").version.as_deref(), Some("1.0"));
+    assert_eq!(
+        find(&inv, "ghost").version_source,
+        Some(inventory::VersionSource::WpCli)
+    );
     assert!(warned(
         &inv,
         "plugin ghost: listed by WP-CLI but not found in the files"
