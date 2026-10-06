@@ -999,6 +999,125 @@ fn component(
     }
 }
 
+/// How to run WP-CLI for [`enrich_with_wp_cli`]
+#[derive(Debug, Clone)]
+pub struct WpCli {
+    /// The `wp` executable
+    pub program: PathBuf,
+    /// WordPress root (`--path`); WP-CLI's own lookup when `None`
+    pub path: Option<PathBuf>,
+    /// Pass `--allow-root` (WP-CLI refuses to run as root otherwise)
+    pub allow_root: bool,
+}
+
+impl Default for WpCli {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("wp"),
+            path: None,
+            allow_root: false,
+        }
+    }
+}
+
+/// One row of `wp plugin list --format=json` / `wp theme list --format=json`
+#[derive(Debug, Deserialize)]
+struct WpCliItem {
+    name: String,
+    status: Option<String>,
+    version: Option<String>,
+    update_version: Option<String>,
+}
+
+/// Merge `status` and `update_version` from WP-CLI, which reads the
+/// WordPress database and so knows what files alone cannot (active or
+/// not). Files stay the source of truth for versions: a disagreement is a
+/// warning, and a component WP-CLI lists that the files lacked is added
+/// with a warning. Any failure is a warning, never an error; the native
+/// inventory is still complete without WP-CLI.
+pub fn enrich_with_wp_cli(inv: &mut Inventory, wp: &WpCli) {
+    let mut any = false;
+    for (what, kinds) in [
+        ("plugin", &[Kind::Plugin, Kind::MuPlugin, Kind::Dropin][..]),
+        ("theme", &[Kind::Theme][..]),
+    ] {
+        let items = match run_wp_cli(wp, what) {
+            Ok(items) => items,
+            Err(e) => {
+                inv.warnings.push(format!(
+                    "wp {what} list failed, keeping file data only: {e}"
+                ));
+                continue;
+            }
+        };
+        any = true;
+        for item in items {
+            let blank = |v: Option<String>| v.filter(|s| !s.is_empty());
+            let (status, update) = (blank(item.status), blank(item.update_version));
+            let version = blank(item.version);
+            let found = inv.components.iter_mut().find(|c| {
+                kinds.contains(&c.kind) && (c.slug == item.name || c.main_file == item.name)
+            });
+            match found {
+                Some(c) => {
+                    if c.version.is_some() && version.is_some() && c.version != version {
+                        inv.warnings.push(format!(
+                            "{what} {}: files say version {}, WP-CLI says {}",
+                            c.slug,
+                            c.version.as_deref().unwrap_or_default(),
+                            version.as_deref().unwrap_or_default()
+                        ));
+                    }
+                    c.status = status;
+                    c.update_version = update;
+                }
+                None => {
+                    inv.warnings.push(format!(
+                        "{what} {}: listed by WP-CLI but not found in the files",
+                        item.name
+                    ));
+                    let kind = match (what, status.as_deref()) {
+                        ("theme", _) => Kind::Theme,
+                        (_, Some("must-use")) => Kind::MuPlugin,
+                        (_, Some("dropin")) => Kind::Dropin,
+                        _ => Kind::Plugin,
+                    };
+                    let mut c = component(kind, &item.name, &item.name, "", &HashMap::new());
+                    c.version = version;
+                    c.status = status;
+                    c.update_version = update;
+                    inv.components.push(c);
+                }
+            }
+        }
+    }
+    inv.source.wp_cli = any;
+}
+
+fn run_wp_cli(wp: &WpCli, what: &str) -> std::result::Result<Vec<WpCliItem>, String> {
+    let mut cmd = std::process::Command::new(&wp.program);
+    cmd.args([what, "list", "--format=json"]);
+    if let Some(ref path) = wp.path {
+        cmd.arg(format!("--path={}", path.display()));
+    }
+    if wp.allow_root {
+        cmd.arg("--allow-root");
+    }
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", wp.program.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        return Err(format!("{} {first}", out.status));
+    }
+    // WP-CLI may print PHP notices before the JSON
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json = stdout.find('[').map_or("", |i| &stdout[i..]);
+    serde_json::from_str(json).map_err(|e| format!("unexpected output: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

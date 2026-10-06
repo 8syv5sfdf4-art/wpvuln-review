@@ -102,6 +102,18 @@ struct InventoryArgs {
     /// Which components a list contains
     #[arg(long = "type", default_value = "plugin", value_enum)]
     list_type: ListType,
+
+    /// Also ask WP-CLI (`wp` on PATH) for active/inactive status and available updates
+    #[arg(long)]
+    with_wp_cli: bool,
+
+    /// WordPress root for WP-CLI (default: PATH, when it is a WordPress root)
+    #[arg(long, value_name = "DIR", requires = "with_wp_cli")]
+    wp_path: Option<PathBuf>,
+
+    /// Pass --allow-root to WP-CLI
+    #[arg(long, requires = "with_wp_cli")]
+    allow_root: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -595,7 +607,23 @@ async fn pull_cli(
 }
 
 fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {
-    let inv = inventory::read(&args.path)?;
+    let mut inv = inventory::read(&args.path)?;
+    if args.with_wp_cli {
+        if inv.source.kind == inventory::SourceKind::Archive {
+            return Err(wordpress_vulnerable_scanner::Error::Inventory(
+                "--with-wp-cli needs a live WordPress directory, not an archive".to_string(),
+            ));
+        }
+        let path = args.wp_path.clone().or_else(|| {
+            (inv.source.layout == inventory::Layout::Wordpress).then(|| args.path.clone())
+        });
+        let wp = inventory::WpCli {
+            path,
+            allow_root: args.allow_root,
+            ..Default::default()
+        };
+        inventory::enrich_with_wp_cli(&mut inv, &wp);
+    }
     let text = match args.format {
         InventoryFormat::Json => serde_json::to_string_pretty(&inv)? + "\n",
         InventoryFormat::List => inv.to_list(match args.list_type {

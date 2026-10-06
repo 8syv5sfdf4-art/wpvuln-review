@@ -140,6 +140,12 @@ themes (with their parent theme), core, and header details such as the text
 domain and plugin URI. `--format list` prints `slug:version` lines for
 `--plugins-file`; add `--type theme` or `--type core` for the other lists.
 
+Files alone cannot tell whether a plugin is active. Where WP-CLI is installed,
+`--with-wp-cli` (plus `--wp-path DIR` and `--allow-root` if needed) adds each
+component's `status` and `update_version` from `wp plugin list` and
+`wp theme list`. Versions still come from the files; if WP-CLI fails, the
+inventory is kept as is and the failure is reported.
+
 Anything that could not be read is listed as a warning on stderr (and in the
 JSON) instead of being skipped silently: folders without a plugin header,
 missing versions, folders with several plugin headers, symlinks leaving the

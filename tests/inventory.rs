@@ -436,3 +436,105 @@ fn cli_fails_with_exit_10_on_bad_input() {
         .unwrap();
     assert_eq!(out.status.code(), Some(10));
 }
+
+/// A stand-in `wp` that prints canned JSON and records its arguments
+#[cfg(unix)]
+fn fake_wp(dir: &Path, plugins: &str, themes: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("wp");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> \"{log}\"\ncase \"$1\" in\n  plugin) echo 'PHP Notice: noise'; echo '{plugins}' ;;\n  theme) echo '{themes}' ;;\nesac\n",
+            log = dir.join("args.log").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn wp_cli_adds_status_and_updates() {
+    let dir = temp_dir("wp-cli");
+    let plugins = r#"[{"name":"akismet","status":"active","update":"available","version":"5.3","update_version":"5.4"},
+        {"name":"hello","status":"inactive","update":"none","version":"1.7.2","update_version":""},
+        {"name":"chaty-pro2","status":"active","update":"none","version":"3.3.5","update_version":""},
+        {"name":"loader","status":"must-use","version":"","update_version":""},
+        {"name":"object-cache.php","status":"dropin","version":"1.5.9","update_version":""},
+        {"name":"ghost","status":"active","version":"1.0","update_version":""}]"#
+        .replace('\n', "");
+    let themes = r#"[{"name":"storefront","status":"parent","version":"4.5.0","update_version":"4.6.0"},{"name":"storefront-child","status":"active","version":"1.0.0","update_version":""}]"#;
+    let wp = inventory::WpCli {
+        program: fake_wp(&dir, &plugins, themes),
+        path: Some(PathBuf::from("/srv/www")),
+        allow_root: true,
+    };
+    let mut inv = inventory::read(&fixture()).unwrap();
+    inventory::enrich_with_wp_cli(&mut inv, &wp);
+
+    assert!(inv.source.wp_cli);
+    let akismet = find(&inv, "akismet");
+    assert_eq!(akismet.status.as_deref(), Some("active"));
+    assert_eq!(akismet.update_version.as_deref(), Some("5.4"));
+    assert_eq!(find(&inv, "hello").status.as_deref(), Some("inactive"));
+    assert_eq!(find(&inv, "hello").update_version, None);
+    assert_eq!(find(&inv, "loader").status.as_deref(), Some("must-use"));
+    assert_eq!(find(&inv, "object-cache").status.as_deref(), Some("dropin"));
+    assert_eq!(
+        find(&inv, "storefront-child").status.as_deref(),
+        Some("active")
+    );
+    assert_eq!(find(&inv, "latin1").status, None);
+
+    // Files win on versions; disagreements and extras are reported
+    assert_eq!(find(&inv, "chaty-pro2").version.as_deref(), Some("3.3.6"));
+    assert!(warned(
+        &inv,
+        "chaty-pro2: files say version 3.3.6, WP-CLI says 3.3.5"
+    ));
+    assert_eq!(find(&inv, "ghost").version.as_deref(), Some("1.0"));
+    assert!(warned(
+        &inv,
+        "plugin ghost: listed by WP-CLI but not found in the files"
+    ));
+
+    let log = std::fs::read_to_string(dir.join("args.log")).unwrap();
+    assert_eq!(
+        log,
+        "plugin list --format=json --path=/srv/www --allow-root\ntheme list --format=json --path=/srv/www --allow-root\n"
+    );
+}
+
+#[test]
+fn wp_cli_failure_keeps_file_data() {
+    let mut inv = inventory::read(&fixture()).unwrap();
+    let before = inv.components.clone();
+    let wp = inventory::WpCli {
+        program: PathBuf::from("/nonexistent/wp"),
+        ..Default::default()
+    };
+    inventory::enrich_with_wp_cli(&mut inv, &wp);
+    assert!(!inv.source.wp_cli);
+    assert_eq!(inv.components, before);
+    assert!(warned(
+        &inv,
+        "wp plugin list failed, keeping file data only"
+    ));
+    assert!(warned(&inv, "wp theme list failed"));
+}
+
+#[test]
+fn cli_refuses_wp_cli_on_archives() {
+    let dir = temp_dir("wp-cli-archive");
+    let path = dir.join("site.zip");
+    fixture_zip(&path);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["inventory", "--with-wp-cli"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not an archive"));
+}
