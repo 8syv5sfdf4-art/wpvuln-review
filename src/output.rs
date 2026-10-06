@@ -193,12 +193,11 @@ fn add_vulnerability_row(
 
     let vuln_desc = format!("{}: {}", vuln.id, title);
 
-    let fixed = vuln
-        .fixed_in
-        .as_deref()
-        .or(vuln.affected_max.as_deref())
-        .map(|v| format!(">{}", v))
-        .unwrap_or_else(|| "-".to_string());
+    let fixed = match (vuln.fixed_in.as_deref(), vuln.affected_max.as_deref()) {
+        (Some(f), _) => format!(">={}", f), // "< X": X is the first fixed version
+        (None, Some(m)) => format!(">{}", m), // "<= X": fixed after X
+        _ => "-".to_string(),
+    };
 
     table.add_row(vec![
         Cell::new(component_name),
@@ -223,8 +222,10 @@ const MAX_TITLE_LENGTH: usize = 40;
 
 /// Truncate title if too long, adding ellipsis
 fn truncate_title(title: &str) -> String {
-    if title.len() > MAX_TITLE_LENGTH {
-        format!("{}...", &title[..MAX_TITLE_LENGTH - 3])
+    // count characters, not bytes, so Persian/CJK titles don't panic
+    if title.chars().count() > MAX_TITLE_LENGTH {
+        let cut: String = title.chars().take(MAX_TITLE_LENGTH - 3).collect();
+        format!("{}...", cut)
     } else {
         title.to_string()
     }
