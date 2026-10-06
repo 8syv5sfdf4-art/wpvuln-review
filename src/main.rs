@@ -662,9 +662,6 @@ fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<E
             core.version.as_deref().unwrap_or("unknown")
         ));
     }
-    for w in &inv.warnings {
-        eprintln!("{} {w}", s.yellow("warning:"));
-    }
     eprintln!(
         "{} {} ({} layout): {}{}",
         s.bold("Inventory"),
@@ -678,7 +675,38 @@ fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<E
             n => format!(", {}", s.yellow(&plural(n, "warning"))),
         }
     );
+    if !inv.warnings.is_empty() {
+        eprintln!("\n{}", s.yellow("Warnings"));
+        let digits = inv.warnings.len().to_string().len();
+        for (i, w) in inv.warnings.iter().enumerate() {
+            let number = format!("{:>digits$}.", i + 1);
+            let indent = " ".repeat(digits + 4);
+            let lines = wrap(w, 96 - indent.len());
+            eprintln!(
+                "  {} {}",
+                s.dim(&number),
+                lines.join(&format!("\n{indent}"))
+            );
+        }
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Greedy word wrap for terminal messages
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("never empty");
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
 }
 
 fn ago(unix: u64) -> String {

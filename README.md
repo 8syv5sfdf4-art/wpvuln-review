@@ -146,10 +146,11 @@ component's `status` and `update_version` from `wp plugin list` and
 `wp theme list`. Versions still come from the files; if WP-CLI fails, the
 inventory is kept as is and the failure is reported.
 
-Anything that could not be read is listed as a warning on stderr (and in the
+Anything the inventory could not resolve is listed as a warning on stderr (and in the
 JSON) instead of being skipped silently: folders without a plugin header,
 missing versions, folders with several plugin headers, symlinks leaving the
-tree, and unsafe archive paths.
+tree, and unsafe archive paths. Each warning says what it means for the scan
+and what to do about it.
 
 ## Offline scans (local database)
 

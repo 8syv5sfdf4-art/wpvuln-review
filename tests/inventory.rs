@@ -103,6 +103,7 @@ fn reads_a_wordpress_root_like_wordpress_does() {
             ),
             (MuPlugin, "loader", None, "loader.php"),
             (Dropin, "object-cache", Some("1.5.9"), "object-cache.php"),
+            (Theme, "orphan-child", Some("0.1"), "orphan-child/style.css"),
             (Theme, "storefront", Some("4.5.0"), "storefront/style.css"),
             (
                 Theme,
@@ -148,7 +149,7 @@ fn warns_instead_of_guessing() {
     let inv = inventory::read(&fixture()).unwrap();
     assert!(warned(
         &inv,
-        "plugins/no-header: no file with a Plugin Name header"
+        "plugins/no-header: 1 .php file at its top level but none with a Plugin Name header"
     ));
     assert!(warned(&inv, "edge-after/edge-after.php: no Version header"));
     assert!(warned(
@@ -160,6 +161,23 @@ fn warns_instead_of_guessing() {
         "plugins/two-headers: 2 files have a Plugin Name header"
     ));
     assert!(warned(&inv, "themes/broken: no style.css"));
+    assert!(warned(
+        &inv,
+        "plugins/leftover: no .php file at its top level (it holds images)"
+    ));
+    assert!(warned(&inv, "plugins/__MACOSX: macOS archive metadata"));
+    assert!(warned(
+        &inv,
+        "plugins: 1 archive file (old-backup.zip) not scanned"
+    ));
+    assert!(warned(
+        &inv,
+        "themes/orphan-child: child theme of \"missing-parent\", which is not installed"
+    ));
+    // Every warning says what it means, not just what happened
+    for w in &inv.warnings {
+        assert!(w.matches(". ").count() >= 1, "unexplained warning: {w}");
+    }
     // Silent files WordPress ignores too
     assert!(!warned(&inv, "plugins/index.php"));
     assert!(!warned(&inv, "notes.txt"));
@@ -223,7 +241,10 @@ fn list_output_round_trips() {
     );
 
     let themes = inv.to_list(ComponentType::Theme);
-    assert_eq!(themes, "storefront:4.5.0\nstorefront-child:1.0.0\n");
+    assert_eq!(
+        themes,
+        "orphan-child:0.1\nstorefront:4.5.0\nstorefront-child:1.0.0\n"
+    );
     assert_eq!(inv.to_list(ComponentType::Core), "6.6.2\n");
 }
 
@@ -256,8 +277,43 @@ fn symlinks_stay_inside_the_tree() {
     let inv = inventory::read(&plugins).unwrap();
     let slugs: Vec<_> = inv.components.iter().map(|c| c.slug.as_str()).collect();
     assert_eq!(slugs, vec!["linked", "real"]);
-    assert!(warned(&inv, "escape: symlink leads outside"));
+    assert!(warned(
+        &inv,
+        "escape: symlink leads outside the scanned tree"
+    ));
     assert!(warned(&inv, "evil.php: symlink leads outside"));
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_links_and_unreadable_folders_are_explained() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = temp_dir("unreadable");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(plugins.join("locked")).unwrap();
+    std::fs::write(
+        plugins.join("locked/locked.php"),
+        "<?php\n/*\nPlugin Name: Locked\n*/\n",
+    )
+    .unwrap();
+    symlink(dir.join("gone"), plugins.join("dangling")).unwrap();
+    std::fs::set_permissions(
+        plugins.join("locked"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let inv = inventory::read(&plugins).unwrap();
+    std::fs::set_permissions(
+        plugins.join("locked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(warned(&inv, "dangling: broken symlink"));
+    // root can read anything, so only check when the lock held
+    if std::fs::read_dir("/root").is_err() {
+        assert!(warned(&inv, "locked: could not list this directory"));
+    }
 }
 
 #[test]
@@ -390,7 +446,8 @@ fn archive_paths_cannot_escape() {
     let inv = inventory::read(&path).unwrap();
     let slugs: Vec<_> = inv.components.iter().map(|c| c.slug.as_str()).collect();
     assert_eq!(slugs, vec!["ok"]);
-    assert!(warned(&inv, "skipped 3 entries with unsafe paths"));
+    assert!(warned(&inv, "skipped 3 entries (e.g. "));
+    assert!(warned(&inv, "with unsafe paths"));
 }
 
 #[test]
@@ -422,7 +479,7 @@ fn cli_writes_a_clean_list_to_stdout() {
     assert!(!stdout.contains("warning"));
     assert!(
         stderr
-            .contains("13 plugins, 2 themes, 1 must-use plugin, 1 drop-in, core 6.6.2, 5 warnings"),
+            .contains("13 plugins, 3 themes, 1 must-use plugin, 1 drop-in, core 6.6.2, 9 warnings"),
         "{stderr}"
     );
     parse_component_list(&stdout, ComponentType::Plugin).unwrap();

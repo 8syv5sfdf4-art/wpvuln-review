@@ -339,14 +339,25 @@ impl FsTree {
 
 impl Tree for FsTree {
     fn list(&mut self, dir: &str, warnings: &mut Vec<String>) -> Vec<Entry> {
-        let Ok(read) = std::fs::read_dir(self.root.join(dir)) else {
-            return Vec::new();
+        let read = match std::fs::read_dir(self.root.join(dir)) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                warnings.push(format!(
+                    "{}: could not list this directory ({e}), so nothing inside it was checked. \
+                     Run inventory as a user that can read wp-content (for example the web \
+                     server user).",
+                    display_dir(dir)
+                ));
+                return Vec::new();
+            }
         };
         let mut out = Vec::new();
         for entry in read.flatten() {
             let Ok(name) = entry.file_name().into_string() else {
                 warnings.push(format!(
-                    "{}: file name is not valid UTF-8, skipped",
+                    "{}: file name is not valid UTF-8, so it was skipped and not checked. \
+                     Rename it to plain UTF-8 (WordPress plugin and theme names always are).",
                     join(dir, &entry.file_name().to_string_lossy())
                 ));
                 continue;
@@ -363,9 +374,20 @@ impl Tree for FsTree {
                             Err(_) => continue,
                         }
                     }
-                    _ => {
+                    Ok(target) => {
                         warnings.push(format!(
-                            "{}: symlink leads outside the scanned tree, skipped",
+                            "{}: symlink leads outside the scanned tree (to {}), so it was not \
+                             followed: a link must not pull in files from elsewhere. If it is a \
+                             real plugin or theme, run inventory on that directory too.",
+                            join(dir, &name),
+                            target.display()
+                        ));
+                        continue;
+                    }
+                    Err(_) => {
+                        warnings.push(format!(
+                            "{}: broken symlink (its target does not exist), skipped. \
+                             WordPress cannot load it either; delete it.",
                             join(dir, &name)
                         ));
                         continue;
@@ -395,7 +417,7 @@ impl Tree for FsTree {
                 Ok(_) => {
                     out.insert(p.clone(), buf);
                 }
-                Err(e) => warnings.push(format!("{p}: unreadable ({e})")),
+                Err(e) => warnings.push(unreadable(p, &e)),
             }
         }
         out
@@ -518,9 +540,22 @@ impl ArchiveTree {
             }
         }
         for (what, label) in [
-            (Skip::Unsafe, "with unsafe paths (absolute or ..)"),
-            (Skip::NotUtf8, "with non-UTF-8 names"),
-            (Skip::Link, "that are links"),
+            (
+                Skip::Unsafe,
+                "with unsafe paths (absolute, a drive letter, or ..). Normal tar and zip tools \
+                 do not create these, so the archive may have been tampered with. Nothing \
+                 outside it was touched, but check where the archive came from",
+            ),
+            (
+                Skip::NotUtf8,
+                "whose names are not valid UTF-8, so they were not checked. Recreate the \
+                 archive on a system with UTF-8 file names",
+            ),
+            (
+                Skip::Link,
+                "that are links, which are not followed inside archives. If a plugin or theme \
+                 is a symlink on the server, run inventory on the server directory instead",
+            ),
         ] {
             let hits: Vec<&String> = skipped
                 .iter()
@@ -529,7 +564,7 @@ impl ArchiveTree {
                 .collect();
             if let Some(first) = hits.first() {
                 warnings.push(format!(
-                    "{}: skipped {} entr{} {label}, e.g. {first}",
+                    "{}: skipped {} entr{} (e.g. {first}) {label}.",
                     path.display(),
                     hits.len(),
                     if hits.len() == 1 { "y" } else { "ies" }
@@ -671,7 +706,7 @@ impl Tree for ArchiveTree {
                         Ok(_) => {
                             out.insert(p.clone(), buf);
                         }
-                        Err(e) => warnings.push(format!("{p}: unreadable ({e})")),
+                        Err(e) => warnings.push(unreadable(p, &e)),
                     }
                 }
             }
@@ -716,7 +751,7 @@ impl Tree for ArchiveTree {
                         Ok(_) => {
                             out.insert(path, buf);
                         }
-                        Err(e) => warnings.push(format!("{path}: unreadable ({e})")),
+                        Err(e) => warnings.push(unreadable(&path, &e)),
                     }
                     if out.len() == wanted.len() {
                         break;
@@ -789,22 +824,37 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
 
     // Collect candidate files first, so archives can be read in one pass
     let mut plugin_files: Vec<(String, String)> = Vec::new(); // (slug, main_file)
-    let mut folders: Vec<String> = Vec::new();
+    let mut folders: Vec<(String, Vec<Entry>)> = Vec::new();
+    let mut archives = Vec::new();
     for e in tree.list(&plugins_dir, &mut warnings) {
         if e.name.starts_with('.') {
             continue;
         }
         if e.is_dir {
-            folders.push(e.name.clone());
-            for f in tree.list(&join(&plugins_dir, &e.name), &mut warnings) {
+            let entries = tree.list(&join(&plugins_dir, &e.name), &mut warnings);
+            for f in &entries {
                 if !f.is_dir && !f.name.starts_with('.') && f.name.ends_with(".php") {
                     plugin_files.push((e.name.clone(), format!("{}/{}", e.name, f.name)));
                 }
             }
+            folders.push((e.name, entries));
         } else if e.name.ends_with(".php") {
             let slug = e.name.trim_end_matches(".php").to_string();
             plugin_files.push((slug, e.name.clone()));
+        } else if is_archive_name(&e.name) {
+            archives.push(e.name);
         }
+    }
+    if !archives.is_empty() {
+        warnings.push(format!(
+            "{}: {} archive file{} ({}) not scanned. WordPress ignores archive files, but if \
+             this directory is reachable over the web anyone can download them. Delete them, \
+             or run `inventory` on one to scan what it contains.",
+            display_dir(&plugins_dir),
+            archives.len(),
+            if archives.len() == 1 { "" } else { "s" },
+            preview(&archives)
+        ));
     }
 
     let mut mu_files = Vec::new();
@@ -835,7 +885,8 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
                 theme_dirs.push(e.name);
             } else {
                 warnings.push(format!(
-                    "{}: no style.css, not a theme",
+                    "{}: no style.css, so WordPress does not list it as a theme and it is not \
+                     scanned. Probably a leftover of a removed theme; check and delete it.",
                     join(&themes_dir, &e.name)
                 ));
             }
@@ -875,7 +926,11 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         let h = plugin_headers.parse(bytes);
         let Some(name) = h.get("Plugin Name") else {
             if !file.contains('/') && file != "index.php" {
-                warnings.push(format!("{path}: no Plugin Name header, not a plugin"));
+                warnings.push(format!(
+                    "{path}: .php file without a Plugin Name header, so WordPress does not load \
+                     it as a plugin and it is not scanned. Unless another plugin includes it, it \
+                     is a leftover and can be removed."
+                ));
             }
             continue;
         };
@@ -883,20 +938,44 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
             found_in.entry(slug).or_default().push(file);
         }
         if !h.contains_key("Version") {
-            warnings.push(format!("{path}: no Version header, version unknown"));
+            warnings.push(no_version(&path, "plugin"));
         }
         components.push(component(Kind::Plugin, slug, name, file, &h));
     }
-    for folder in &folders {
+    for (folder, entries) in &folders {
+        let path = join(&plugins_dir, folder);
+        let php = entries
+            .iter()
+            .filter(|e| !e.is_dir && !e.name.starts_with('.') && e.name.ends_with(".php"))
+            .count();
         match found_in.get(folder.as_str()).map(Vec::as_slice) {
+            None if folder == "__MACOSX" => warnings.push(format!(
+                "{path}: macOS archive metadata (left behind when a zip made on a Mac is \
+                 unpacked), not code. WordPress ignores it; it is safe to delete."
+            )),
+            None if php == 0 => {
+                let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+                warnings.push(format!(
+                    "{path}: no .php file at its top level ({}), so WordPress does not load it as \
+                     a plugin and it is not scanned. If it is left over from a removed plugin, \
+                     delete it; if it is other data, keep it outside the web root.",
+                    if names.is_empty() {
+                        "the folder is empty".to_string()
+                    } else {
+                        format!("it holds {}", preview(&names))
+                    }
+                ));
+            }
             None => warnings.push(format!(
-                "{}: no file with a Plugin Name header, not a plugin",
-                join(&plugins_dir, folder)
+                "{path}: {php} .php file{} at its top level but none with a Plugin Name header, so \
+                 WordPress does not load it as a plugin and it is not scanned. It may be a \
+                 partial upload or a damaged copy; compare it with the original plugin.",
+                if php == 1 { "" } else { "s" }
             )),
             Some([_]) => {}
             Some(files) => warnings.push(format!(
-                "{}: {} files have a Plugin Name header ({}); WordPress lists each as a separate plugin",
-                join(&plugins_dir, folder),
+                "{path}: {} files have a Plugin Name header ({}). WordPress lists each as a \
+                 separate plugin, so each is inventoried and scanned under the slug {folder}.",
                 files.len(),
                 files.join(", ")
             )),
@@ -940,22 +1019,41 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         let Some(bytes) = head(&path) else { continue };
         let h = theme_headers.parse(bytes);
         let Some(name) = h.get("Theme Name") else {
-            warnings.push(format!("{path}: no Theme Name header, not a theme"));
+            warnings.push(format!(
+                "{path}: no Theme Name header, so WordPress lists it as a broken theme and it is \
+                 not scanned. Reinstall the theme or delete the folder."
+            ));
             continue;
         };
         if !h.contains_key("Version") {
-            warnings.push(format!("{path}: no Version header, version unknown"));
+            warnings.push(no_version(&path, "theme"));
         }
         let mut c = component(Kind::Theme, dir, name, &format!("{dir}/style.css"), &h);
         c.uri = h.get("Theme URI").cloned();
         c.parent = h.get("Template").filter(|t| *t != dir).cloned();
         components.push(c);
     }
+    for c in components.iter().filter(|c| c.kind == Kind::Theme) {
+        if let Some(ref parent) = c.parent
+            && !theme_dirs.contains(parent)
+        {
+            warnings.push(format!(
+                "{}: child theme of \"{parent}\", which is not installed. WordPress shows it as \
+                 broken and cannot use it; install the parent theme or delete the child. The \
+                 child itself is still scanned.",
+                join(&content, &format!("themes/{}", c.slug))
+            ));
+        }
+    }
 
     let core = (layout == Layout::Wordpress).then(|| {
         let version = head(&core_file).and_then(core_version);
         if version.is_none() {
-            warnings.push(format!("{core_file}: no $wp_version found"));
+            warnings.push(format!(
+                "{core_file}: no $wp_version found, so the WordPress version is unknown and core \
+                 is not scanned. The file may have been modified; compare it with a clean \
+                 WordPress download, or check the version in wp-admin."
+            ));
         }
         Core { version }
     });
@@ -973,6 +1071,49 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         components,
         warnings,
     })
+}
+
+/// Warning for a plugin or theme without a usable version
+fn no_version(path: &str, what: &str) -> String {
+    format!(
+        "{path}: no Version header, so the installed version is unknown. The scan cannot \
+         compare it with vulnerable version ranges and will list it as not checked. A {what} \
+         without a version is usually custom code: review it by hand, or look up the version \
+         in wp-admin."
+    )
+}
+
+/// Warning for a file whose headers could not be read
+fn unreadable(path: &str, e: &dyn std::fmt::Display) -> String {
+    format!(
+        "{path}: could not be read ({e}), so its headers were not checked and whatever it \
+         declares is missing from this inventory. Run inventory as a user that can read \
+         wp-content (for example the web server user), or re-copy the file."
+    )
+}
+
+/// Up to three names, then how many more: `a, b, c and 4 more`
+fn preview(names: &[String]) -> String {
+    let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    match names.len() {
+        0..=3 => shown,
+        n => format!("{shown} and {} more", n - 3),
+    }
+}
+
+/// Root-relative directory for messages
+fn display_dir(dir: &str) -> &str {
+    if dir.is_empty() { "top level" } else { dir }
+}
+
+/// File names that look like archives someone left behind
+fn is_archive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".zst", ".bz2", ".xz",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
 }
 
 fn component(
@@ -1045,7 +1186,10 @@ pub fn enrich_with_wp_cli(inv: &mut Inventory, wp: &WpCli) {
             Ok(items) => items,
             Err(e) => {
                 inv.warnings.push(format!(
-                    "wp {what} list failed, keeping file data only: {e}"
+                    "wp {what} list failed, keeping file data only ({e}). The inventory is \
+                     still complete, only {what} status and available updates are missing. \
+                     Check that `wp {what} list` works here; pass --wp-path for a different \
+                     directory, or --allow-root when running as root."
                 ));
                 continue;
             }
@@ -1062,7 +1206,9 @@ pub fn enrich_with_wp_cli(inv: &mut Inventory, wp: &WpCli) {
                 Some(c) => {
                     if c.version.is_some() && version.is_some() && c.version != version {
                         inv.warnings.push(format!(
-                            "{what} {}: files say version {}, WP-CLI says {}",
+                            "{what} {}: files say version {}, WP-CLI says {}. WP-CLI reads \
+                             the same headers, so it probably looked at a different copy of \
+                             the site (check --wp-path). The version from the files is used.",
                             c.slug,
                             c.version.as_deref().unwrap_or_default(),
                             version.as_deref().unwrap_or_default()
@@ -1073,7 +1219,9 @@ pub fn enrich_with_wp_cli(inv: &mut Inventory, wp: &WpCli) {
                 }
                 None => {
                     inv.warnings.push(format!(
-                        "{what} {}: listed by WP-CLI but not found in the files",
+                        "{what} {}: listed by WP-CLI but not found in the files, so WP-CLI \
+                         probably looked at a different copy of the site (check --wp-path). \
+                         Added with WP-CLI's version so it is still scanned.",
                         item.name
                     ));
                     let kind = match (what, status.as_deref()) {
