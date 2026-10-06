@@ -109,6 +109,12 @@ fn reads_a_wordpress_root_like_wordpress_does() {
             ),
             (MuPlugin, "loader", None, "loader.php"),
             (Dropin, "object-cache", Some("1.5.9"), "object-cache.php"),
+            (
+                Theme,
+                "flatsome",
+                Some("3.18.7"),
+                "flatsome-download/flatsome/style.css"
+            ),
             (Theme, "orphan-child", Some("0.1"), "orphan-child/style.css"),
             (Theme, "storefront", Some("4.5.0"), "storefront/style.css"),
             (
@@ -181,7 +187,15 @@ fn warns_instead_of_guessing() {
         &inv,
         "plugins/two-headers: 2 files have a Plugin Name header"
     ));
-    assert!(warned(&inv, "themes/broken: no style.css"));
+    assert!(warned(
+        &inv,
+        "themes/broken: no style.css, so WordPress does not list it"
+    ));
+    assert!(warned(
+        &inv,
+        "themes/flatsome-download: no style.css of its own, but WordPress also looks one level \
+         deeper and loads the theme found there (flatsome-download/flatsome)"
+    ));
     assert!(warned(
         &inv,
         "edge-after/edge-after.php: no Version header and no readme.txt Stable tag"
@@ -286,7 +300,7 @@ fn list_output_round_trips() {
     let themes = inv.to_list(ComponentType::Theme);
     assert_eq!(
         themes,
-        "orphan-child:0.1\nstorefront:4.5.0\nstorefront-child:1.0.0\n"
+        "flatsome:3.18.7\norphan-child:0.1\nstorefront:4.5.0\nstorefront-child:1.0.0\n"
     );
     assert_eq!(inv.to_list(ComponentType::Core), "6.6.2\n");
 }
@@ -522,7 +536,7 @@ fn cli_writes_a_clean_list_to_stdout() {
     assert!(!stdout.contains("warning"));
     assert!(
         stderr
-            .contains("13 plugins, 3 themes, 1 must-use plugin, 1 drop-in, 1 unloaded plugin, core 6.6.2, 10 warnings"),
+            .contains("13 plugins, 4 themes, 1 must-use plugin, 1 drop-in, 1 unloaded plugin, core 6.6.2, 11 warnings"),
         "{stderr}"
     );
     parse_component_list(&stdout, ComponentType::Plugin).unwrap();

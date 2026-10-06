@@ -933,18 +933,48 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
             if !e.is_dir || e.name.starts_with('.') || e.name == "CVS" {
                 continue;
             }
-            let has_style = tree
-                .list(&join(&themes_dir, &e.name), &mut warnings)
-                .iter()
-                .any(|f| !f.is_dir && f.name == "style.css");
-            if has_style {
+            let entries = tree.list(&join(&themes_dir, &e.name), &mut warnings);
+            if entries.iter().any(|f| !f.is_dir && f.name == "style.css") {
                 theme_dirs.push(e.name);
-            } else {
+                continue;
+            }
+            // search_theme_directories() also accepts themes one level down
+            let mut nested = Vec::new();
+            for sub in entries
+                .iter()
+                .filter(|f| f.is_dir && !f.name.starts_with('.'))
+            {
+                let sub_dir = format!("{}/{}", e.name, sub.name);
+                if tree
+                    .list(&join(&themes_dir, &sub_dir), &mut warnings)
+                    .iter()
+                    .any(|f| !f.is_dir && f.name == "style.css")
+                {
+                    nested.push(sub_dir);
+                }
+            }
+            if nested.is_empty() {
                 warnings.push(format!(
                     "{}: no style.css, so WordPress does not list it as a theme and it is not \
                      scanned. Probably a leftover of a removed theme; check and delete it.",
                     join(&themes_dir, &e.name)
                 ));
+            } else {
+                warnings.push(format!(
+                    "{}: no style.css of its own, but WordPress also looks one level deeper and \
+                     loads the theme{} found there ({}), usually the result of unzipping a theme \
+                     into a folder of the same name. {} inventoried and scanned under the inner \
+                     folder name; reinstalling at themes/<name> avoids the extra level.",
+                    join(&themes_dir, &e.name),
+                    if nested.len() == 1 { "" } else { "s" },
+                    preview(&nested),
+                    if nested.len() == 1 {
+                        "It is"
+                    } else {
+                        "They are"
+                    }
+                ));
+                theme_dirs.extend(nested);
             }
         }
     }
@@ -1125,20 +1155,32 @@ fn walk(tree: &mut impl Tree) -> Result<Inventory> {
         if !h.contains_key("Version") {
             warnings.push(no_version(&path, "theme"));
         }
-        let mut c = component(Kind::Theme, dir, name, &format!("{dir}/style.css"), &h);
+        let slug = dir.rsplit('/').next().unwrap_or(dir);
+        let mut c = component(Kind::Theme, slug, name, &format!("{dir}/style.css"), &h);
         c.uri = h.get("Theme URI").cloned();
-        c.parent = h.get("Template").filter(|t| *t != dir).cloned();
+        c.parent = h
+            .get("Template")
+            .filter(|t| *t != dir && *t != slug)
+            .cloned();
         components.push(c);
     }
     for c in components.iter().filter(|c| c.kind == Kind::Theme) {
+        let installed = |p: &str| {
+            theme_dirs
+                .iter()
+                .any(|d| d == p || d.rsplit('/').next() == Some(p))
+        };
         if let Some(ref parent) = c.parent
-            && !theme_dirs.contains(parent)
+            && !installed(parent)
         {
             warnings.push(format!(
                 "{}: child theme of \"{parent}\", which is not installed. WordPress shows it as \
                  broken and cannot use it; install the parent theme or delete the child. The \
                  child itself is still scanned.",
-                join(&content, &format!("themes/{}", c.slug))
+                join(
+                    &content,
+                    &format!("themes/{}", c.main_file.trim_end_matches("/style.css"))
+                )
             ));
         }
     }
