@@ -28,6 +28,13 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
+    #[command(flatten)]
+    scan: ScanArgs,
+}
+
+/// Everything a scan takes; the same flags work with and without `scan`
+#[derive(ClapArgs, Debug)]
+struct ScanArgs {
     /// URL of the WordPress site to scan
     url: Option<String>,
 
@@ -49,6 +56,25 @@ struct Args {
     /// Minimum severity level to report
     #[arg(long = "severity", default_value = "low", value_enum)]
     min_severity: SeverityArg,
+
+    /// Exit non-zero only for vulnerabilities at or above this severity
+    /// (none: never); without it, any vulnerability exits 1 and critical 2
+    #[arg(long, value_enum, value_name = "SEVERITY")]
+    fail_on: Option<FailOn>,
+
+    /// Also exit 1 when any component could not be checked
+    #[arg(long)]
+    fail_on_unchecked: bool,
+}
+
+/// Threshold for `--fail-on`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FailOn {
+    None,
+    Low,
+    Medium,
+    High,
+    Critical,
 }
 
 /// Component inputs shared by scanning and `db pull`
@@ -92,8 +118,13 @@ struct Inputs {
     aliases: Option<PathBuf>,
 }
 
+// Parsed once per run, so the size difference between variants is irrelevant
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Check components for known vulnerabilities (the default when no
+    /// subcommand is given)
+    Scan(ScanArgs),
     /// Manage a local vulnerability database for offline scans
     #[command(subcommand)]
     Db(DbCommand),
@@ -356,16 +387,8 @@ async fn main() -> ExitCode {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
         Some(Command::Inventory(ref inv)) => run_inventory(inv),
         Some(Command::Aliases(ref cmd)) => run_aliases(cmd).await,
-        None => {
-            // Print banner for human output
-            if matches!(args.output_format, OutputFormatArg::Human) {
-                print_banner();
-            }
-            let output_config =
-                OutputConfig::new(args.output_format.into(), args.min_severity.into())
-                    .with_color(Style::stdout().0);
-            run_scan(&args, &output_config).await
-        }
+        Some(Command::Scan(ref scan)) => run_scan(scan).await,
+        None => run_scan(&args.scan).await,
     };
 
     match result {
@@ -377,10 +400,13 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_scan(
-    args: &Args,
-    output_config: &OutputConfig,
-) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    // Print banner for human output
+    if matches!(args.output_format, OutputFormatArg::Human) {
+        print_banner();
+    }
+    let output_config = &OutputConfig::new(args.output_format.into(), args.min_severity.into())
+        .with_color(Style::stdout().0);
     // Build scan result from various input sources
     let scan_result = build_scan_result(args).await?;
 
@@ -398,17 +424,56 @@ async fn run_scan(
     let mut writer = stdout.lock();
     output_analysis(&analysis, output_config, &mut writer)?;
 
-    // Return appropriate exit code
-    Ok(if analysis.summary.critical > 0 {
-        ExitCode::from(2) // Critical vulnerabilities
-    } else if analysis.summary.has_any() {
-        ExitCode::from(1) // Some vulnerabilities
-    } else {
-        ExitCode::SUCCESS // No vulnerabilities
-    })
+    Ok(ExitCode::from(exit_code(
+        &analysis,
+        args.fail_on,
+        args.fail_on_unchecked,
+    )))
 }
 
-async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<ScanResult> {
+/// 2 for critical, 1 for other vulnerabilities, 0 otherwise. `fail_on`
+/// ignores findings below a severity; `fail_unchecked` turns a would-be 0
+/// into 1 when anything could not be checked.
+fn exit_code(
+    analysis: &wordpress_vulnerable_scanner::Analysis,
+    fail_on: Option<FailOn>,
+    fail_unchecked: bool,
+) -> u8 {
+    let s = &analysis.summary;
+    let threshold = match fail_on {
+        None | Some(FailOn::Low) => Some(Severity::Low),
+        Some(FailOn::Medium) => Some(Severity::Medium),
+        Some(FailOn::High) => Some(Severity::High),
+        Some(FailOn::Critical) => Some(Severity::Critical),
+        Some(FailOn::None) => None,
+    };
+    let at_least = |sev: Severity| threshold.is_some_and(|t| sev >= t);
+    let count = |sev: Severity| match sev {
+        Severity::Critical => s.critical,
+        Severity::High => s.high,
+        Severity::Medium => s.medium,
+        Severity::Low => s.low,
+    };
+    let failing = [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+    ]
+    .into_iter()
+    .filter(|&sev| at_least(sev))
+    .map(count)
+    .sum::<usize>();
+    if at_least(Severity::Critical) && s.critical > 0 {
+        2
+    } else if failing > 0 || (fail_unchecked && s.not_checked > 0) {
+        1
+    } else {
+        0
+    }
+}
+
+async fn build_scan_result(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ScanResult> {
     // URL scan mode
     if let Some(ref url) = args.url {
         // Add http:// if no scheme provided

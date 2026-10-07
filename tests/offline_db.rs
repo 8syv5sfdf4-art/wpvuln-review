@@ -472,3 +472,56 @@ async fn live_api_mode_never_reports_unknowns_as_clean() {
     assert_eq!(states, vec![Clean, Untracked, Failed]);
     assert_eq!(analysis.summary.not_checked, 2);
 }
+
+/// Run the CLI against `db`; returns (exit code, stdout)
+fn cli(db: &std::path::Path, args: &[&str]) -> (i32, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(args)
+        .arg("--db")
+        .arg(db)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn scan_subcommand_and_exit_code_controls() {
+    let dir = temp_db("fail-on");
+    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+    // akismet 5.3: one High (7.5) finding; premium: untracked
+    std::fs::write(dir.join("plugin/akismet.json"), affected_below("9.0")).unwrap();
+    std::fs::write(
+        dir.join("plugin/premium.json"),
+        r#"{"error":0,"message":null,"data":null}"#,
+    )
+    .unwrap();
+
+    let without_date = |json: &str| {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v.as_object_mut().unwrap().remove("scan_date");
+        v
+    };
+    let (top, top_out) = cli(&dir, &["-o", "json", "-p", "akismet:5.3"]);
+    let (sub, sub_out) = cli(&dir, &["scan", "-o", "json", "-p", "akismet:5.3"]);
+    assert_eq!((top, sub), (1, 1));
+    assert_eq!(without_date(&top_out), without_date(&sub_out));
+
+    let code = |args: &[&str]| cli(&dir, &[&["scan", "-o", "none"], args].concat()).0;
+    assert_eq!(code(&["-p", "akismet:5.3", "--fail-on", "high"]), 1);
+    assert_eq!(code(&["-p", "akismet:5.3", "--fail-on", "critical"]), 0);
+    assert_eq!(code(&["-p", "akismet:5.3", "--fail-on", "none"]), 0);
+    assert_eq!(
+        code(&["-p", "premium:1.0"]),
+        0,
+        "unchecked alone does not fail"
+    );
+    assert_eq!(code(&["-p", "premium:1.0", "--fail-on-unchecked"]), 1);
+    assert_eq!(
+        code(&["-p", "akismet", "--fail-on-unchecked"]),
+        1,
+        "no version"
+    );
+}

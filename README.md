@@ -367,6 +367,13 @@ health. This applies to live API scans as well as `--db` scans. `--db` and `--ap
 | 2 | Critical vulnerabilities found |
 | 10 | Error (network, parsing, etc.) |
 
+For CI, `--fail-on <none|low|medium|high|critical>` only lets findings at or
+above that severity fail the run (`none`: never), and `--fail-on-unchecked`
+exits 1 when nothing was found but some component could not be checked.
+
+`wordpress-vulnerable-scanner scan ...` is the same as the top-level form; use
+whichever reads better in scripts.
+
 ## Severity Levels
 
 Based on CVSS v3 scores:
