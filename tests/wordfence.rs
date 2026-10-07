@@ -197,3 +197,46 @@ fn real_feed_smoke_test() {
     assert!(affecting(std::slice::from_ref(cve), "10.3.7").is_empty());
     assert!(took.as_secs_f32() < 5.0, "too slow: {took:?}");
 }
+
+#[test]
+fn snapshots_diff_per_component() {
+    use wordpress_vulnerable_scanner::changes::{ChangeKind, diff_snapshots};
+    let old = load("wpprobe-sample.json");
+    // Next snapshot: Chaty Pro's record gone, a WooCommerce branch added,
+    // a new plugin published
+    let text = std::fs::read_to_string(fixture("wpprobe-sample.json")).unwrap();
+    let mut records: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    records.retain(|r| r["slug"] != "chaty-pro");
+    let mut branch = records[0].clone();
+    branch["from_version"] = "10.4.0".into();
+    branch["to_version"] = "10.4.2".into();
+    records.push(branch);
+    let mut fresh = records[0].clone();
+    fresh["slug"] = "brand-new".into();
+    fresh["cve"] = "CVE-2026-55555".into();
+    records.push(fresh);
+    let new = WordfenceIndex::from_reader(
+        serde_json::to_string(&records).unwrap().as_bytes(),
+        &Keep::All,
+    )
+    .unwrap();
+
+    let changes = diff_snapshots(old.entries(), new.entries(), "wordfence", 1);
+    let got: Vec<_> = changes
+        .iter()
+        .map(|c| (c.key.as_str(), c.change, c.uuid.as_deref().unwrap_or("")))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("plugin/brand-new", ChangeKind::Added, "CVE-2026-55555"),
+            ("plugin/chaty-pro", ChangeKind::Removed, "CVE-2026-73360"),
+            ("plugin/woocommerce", ChangeKind::Changed, "CVE-2025-15033"),
+        ]
+    );
+    assert!(
+        changes
+            .iter()
+            .all(|c| c.source.as_deref() == Some("wordfence"))
+    );
+}

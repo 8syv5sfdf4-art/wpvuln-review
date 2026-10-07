@@ -47,6 +47,7 @@ pub mod scanner;
 pub mod transfer;
 pub mod vulnerability;
 pub mod wordfence;
+pub mod wordfence_db;
 
 // Re-export main types
 pub use analyze::{Analysis, Analyzer, ComponentVulnerabilities, VulnerabilitySummary};
