@@ -39,6 +39,9 @@ pub struct OutputConfig {
     pub format: OutputFormat,
     /// Minimum severity to display
     pub min_severity: Severity,
+    /// Use ANSI colors in human output (turn off when not writing to a
+    /// terminal, or when NO_COLOR is set)
+    pub color: bool,
 }
 
 impl Default for OutputConfig {
@@ -46,6 +49,7 @@ impl Default for OutputConfig {
         Self {
             format: OutputFormat::Human,
             min_severity: Severity::Low,
+            color: true,
         }
     }
 }
@@ -56,7 +60,14 @@ impl OutputConfig {
         Self {
             format,
             min_severity,
+            color: true,
         }
+    }
+
+    /// Turn colors on or off
+    pub fn with_color(mut self, color: bool) -> Self {
+        self.color = color;
+        self
     }
 }
 
@@ -104,7 +115,7 @@ fn output_human<W: Write>(
             "No vulnerabilities found in the {} components that could be checked.\n",
             analysis.components.len() - summary.not_checked
         )?;
-        write_not_checked(analysis, writer)?;
+        write_not_checked(analysis, config.color, writer)?;
         write_summary(analysis, writer)?;
         return Ok(());
     }
@@ -145,7 +156,7 @@ fn output_human<W: Write>(
         // Severity header
         let header = format!("{} ({})", severity.to_string().to_uppercase(), count);
         let header_color = severity_color(severity);
-        writeln!(writer, "{}", colorize(&header, header_color))?;
+        writeln!(writer, "{}", colorize(&header, header_color, config.color))?;
 
         // Build table for this severity level
         let mut table = Table::new();
@@ -173,8 +184,8 @@ fn output_human<W: Write>(
         writeln!(writer)?;
     }
 
-    write_alias_notes(analysis, writer)?;
-    write_not_checked(analysis, writer)?;
+    write_alias_notes(analysis, config.color, writer)?;
+    write_not_checked(analysis, config.color, writer)?;
     write_summary(analysis, writer)?;
     Ok(())
 }
@@ -194,7 +205,7 @@ fn display_name(c: &ComponentVulnerabilities) -> String {
 }
 
 /// Findings that came through an alias need a human to confirm them
-fn write_alias_notes<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
+fn write_alias_notes<W: Write>(analysis: &Analysis, color: bool, writer: &mut W) -> Result<()> {
     let via_alias: Vec<_> = analysis
         .components
         .iter()
@@ -208,7 +219,8 @@ fn write_alias_notes<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()
         "{}",
         colorize(
             "Found through an alias, confirm before acting",
-            Color::Yellow
+            Color::Yellow,
+            color
         )
     )?;
     for c in via_alias {
@@ -225,7 +237,7 @@ fn write_alias_notes<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()
 
 /// Everything that was not compared with any data, grouped by why: these
 /// are neither safe nor vulnerable as far as this scan knows
-fn write_not_checked<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
+fn write_not_checked<W: Write>(analysis: &Analysis, color: bool, writer: &mut W) -> Result<()> {
     if analysis.summary.not_checked == 0 {
         return Ok(());
     }
@@ -237,7 +249,8 @@ fn write_not_checked<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()
                 "NOT CHECKED ({}): not known to be safe, review by hand",
                 analysis.summary.not_checked
             ),
-            Color::Yellow
+            Color::Yellow,
+            color
         )
     )?;
     for (state, why) in [
@@ -354,7 +367,10 @@ fn truncate_title(title: &str) -> String {
 }
 
 /// Apply ANSI color to text
-fn colorize(text: &str, color: Color) -> String {
+fn colorize(text: &str, color: Color, enabled: bool) -> String {
+    if !enabled {
+        return text.to_string();
+    }
     let code = match color {
         Color::Red => "31",
         Color::Yellow => "33",

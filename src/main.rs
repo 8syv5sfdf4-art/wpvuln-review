@@ -362,7 +362,8 @@ async fn main() -> ExitCode {
                 print_banner();
             }
             let output_config =
-                OutputConfig::new(args.output_format.into(), args.min_severity.into());
+                OutputConfig::new(args.output_format.into(), args.min_severity.into())
+                    .with_color(Style::stdout().0);
             run_scan(&args, &output_config).await
         }
     };

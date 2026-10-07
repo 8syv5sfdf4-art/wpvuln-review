@@ -431,10 +431,13 @@ fn every_component_ends_in_exactly_one_state() {
         .arg(&fixture)
         .arg("--aliases")
         .arg(&aliases)
-        .env("NO_COLOR", "1")
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains('\u{1b}'),
+        "no ANSI codes when piped: {text:?}"
+    );
     assert!(text.contains("NOT CHECKED ("), "{text}");
     assert!(text.contains("chaty-pro2 (as chaty)"));
     assert!(
