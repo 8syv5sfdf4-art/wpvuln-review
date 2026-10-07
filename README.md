@@ -355,8 +355,14 @@ health. This applies to live API scans as well as `--db` scans. `--db` and `--ap
 | Format | Flag | Description |
 |--------|------|-------------|
 | Human | `-o human` | Colored table (default) |
-| JSON | `-o json` | Machine-readable JSON |
+| JSON | `-o json` | Machine-readable JSON, with a `state` per component |
+| CSV | `-o csv` | One row per finding, plus one per component without findings |
+| Markdown | `-o markdown` | Report for people: summary, findings, alias matches, not checked |
 | None | `-o none` | Silent (exit code only) |
+
+Every format accounts for every component, including the ones that could not
+be checked, with the reason. `--severity` hides lower findings from the human,
+CSV and Markdown reports; JSON always holds everything.
 
 ## Exit Codes
 

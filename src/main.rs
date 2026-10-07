@@ -346,6 +346,8 @@ enum DbCommand {
 enum OutputFormatArg {
     Human,
     Json,
+    Csv,
+    Markdown,
     None,
 }
 
@@ -354,6 +356,8 @@ impl From<OutputFormatArg> for OutputFormat {
         match arg {
             OutputFormatArg::Human => OutputFormat::Human,
             OutputFormatArg::Json => OutputFormat::Json,
+            OutputFormatArg::Csv => OutputFormat::Csv,
+            OutputFormatArg::Markdown => OutputFormat::Markdown,
             OutputFormatArg::None => OutputFormat::None,
         }
     }

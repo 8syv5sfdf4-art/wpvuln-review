@@ -15,6 +15,10 @@ pub enum OutputFormat {
     Human,
     /// JSON output
     Json,
+    /// CSV: one row per finding, and per component without findings
+    Csv,
+    /// Markdown report for people
+    Markdown,
     /// No output (silent mode)
     None,
 }
@@ -26,6 +30,8 @@ impl FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "human" => Ok(Self::Human),
             "json" => Ok(Self::Json),
+            "csv" => Ok(Self::Csv),
+            "markdown" | "md" => Ok(Self::Markdown),
             "none" => Ok(Self::None),
             _ => Err(Error::InvalidOutputFormat(s.to_string())),
         }
@@ -80,6 +86,10 @@ pub fn output_analysis<W: Write>(
     match config.format {
         OutputFormat::Human => output_human(analysis, config, writer),
         OutputFormat::Json => output_json(analysis, writer),
+        OutputFormat::Csv => crate::report::write_csv(analysis, config.min_severity, writer),
+        OutputFormat::Markdown => {
+            crate::report::write_markdown(analysis, config.min_severity, writer)
+        }
         OutputFormat::None => Ok(()),
     }
 }

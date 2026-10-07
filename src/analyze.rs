@@ -328,8 +328,8 @@ impl Analyzer {
                 let note = match report.vulnerabilities.len() {
                     0 => "no version could be read".to_string(),
                     n => format!(
-                        "no version could be read; {n} known vulnerabilit{} affect some versions",
-                        if n == 1 { "y" } else { "ies" }
+                        "no version could be read; {n} known vulnerabilit{} some versions",
+                        if n == 1 { "y affects" } else { "ies affect" }
                     ),
                 };
                 (ComponentState::UnknownVersion, Vec::new(), Some(note))

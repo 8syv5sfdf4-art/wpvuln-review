@@ -1,0 +1,175 @@
+{
+  "url": null,
+  "scan_date": "2026-10-07T00:00:00Z",
+  "components": [
+    {
+      "component_type": "core",
+      "slug": "wordpress",
+      "version": "6.6.2",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "clean",
+      "matched_via": "slug"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "akismet",
+      "version": "5.3",
+      "vulnerabilities": [
+        {
+          "id": "CVE-2026-0001",
+          "title": "Akismet <= 5.3 – Unauthenticated RCE | \"quoted\", with comma",
+          "severity": "critical",
+          "cvss_score": 9.8,
+          "affected_max": "5.3.1",
+          "max_op": "lt",
+          "affected_min": "5.0",
+          "min_op": "ge",
+          "fixed_in": "5.3.1",
+          "references": [
+            "https://www.cve.org/CVERecord?id=CVE-2026-0001",
+            "https://example.org/wf-1"
+          ],
+          "uuid": "u-crit",
+          "cves": [
+            "CVE-2026-0001"
+          ],
+          "affected": ">= 5.0, < 5.3.1",
+          "unfixed": false,
+          "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+          "cwes": [
+            "CWE-94"
+          ],
+          "known_exploited": true,
+          "description": "[en] Remote code execution."
+        },
+        {
+          "id": "u-low",
+          "title": "Akismet info leak",
+          "severity": "low",
+          "cvss_score": 3.1,
+          "affected_max": "9.9",
+          "max_op": "le",
+          "fixed_in": null,
+          "references": [],
+          "uuid": "u-low",
+          "affected": "<= 9.9",
+          "unfixed": true
+        }
+      ],
+      "max_severity": "critical",
+      "state": "vulnerable",
+      "matched_via": "slug"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "chaty-pro",
+      "version": "3.3.6",
+      "vulnerabilities": [
+        {
+          "id": "CVE-2026-6251",
+          "title": "Chaty Pro < 3.5.6 - SQL Injection",
+          "severity": "high",
+          "cvss_score": 7.5,
+          "affected_max": "3.5.6",
+          "max_op": "lt",
+          "fixed_in": "3.5.6",
+          "references": [
+            "https://www.cve.org/CVERecord?id=CVE-2026-6251"
+          ],
+          "uuid": "u-high",
+          "cves": [
+            "CVE-2026-6251"
+          ],
+          "affected": "< 3.5.6",
+          "unfixed": false,
+          "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+          "cwes": [
+            "CWE-89"
+          ],
+          "description": "SQLi via widget id."
+        }
+      ],
+      "max_severity": "high",
+      "state": "alias_match",
+      "matched_via": "alias",
+      "installed_as": "chaty-pro2",
+      "note": "installed as chaty-pro2, looked up as chaty-pro; premium editions may number versions differently"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "hello-dolly",
+      "version": "1.7.2",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "clean",
+      "matched_via": "slug"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "zhaket-woo-sep",
+      "version": "1.2.1",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "untracked",
+      "matched_via": "slug",
+      "note": "the data source has no entry for it (common for premium and custom code)"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "never-pulled",
+      "version": "1.0",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "not_in_db",
+      "matched_via": "slug",
+      "note": "never pulled into the local database; run `db pull` with the same inputs"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "custom-thing",
+      "version": null,
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "unknown_version",
+      "matched_via": "slug",
+      "note": "no version could be read; 1 known vulnerability affects some versions"
+    },
+    {
+      "component_type": "plugin",
+      "slug": "broken",
+      "version": "1.0",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "failed",
+      "matched_via": "slug",
+      "note": "not a valid WPVulnerability response (blocked, or a damaged record)"
+    },
+    {
+      "component_type": "theme",
+      "slug": "storefront",
+      "version": "4.5.0",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "clean",
+      "matched_via": "slug"
+    }
+  ],
+  "summary": {
+    "critical": 1,
+    "high": 1,
+    "medium": 0,
+    "low": 1,
+    "total": 3,
+    "not_checked": 4,
+    "components": {
+      "vulnerable": 1,
+      "alias_match": 1,
+      "clean": 3,
+      "untracked": 1,
+      "not_in_db": 1,
+      "unknown_version": 1,
+      "failed": 1
+    }
+  }
+}
