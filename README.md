@@ -226,8 +226,26 @@ wordpress-vulnerable-scanner --db wpvuln-db --plugins-file plugins.csv
 wordpress-vulnerable-scanner db status
 ```
 
-`db pull` takes the same inputs as a scan (`-p`, `-t`, `-c`, `-m`, list files)
-and:
+With an inventory, the whole site is one input, and aliases decide what is
+looked up:
+
+```bash
+# on the server (no network)
+wordpress-vulnerable-scanner inventory /var/www/html -o inventory.json
+
+# where the internet works
+wordpress-vulnerable-scanner db pull --inventory inventory.json --aliases aliases.toml
+
+# anywhere, offline
+wordpress-vulnerable-scanner --db wpvuln-db --inventory inventory.json --aliases aliases.toml
+```
+
+Scans leave out inventory components whose version could not be read, and say
+so, since they cannot be compared with vulnerable version ranges. `db pull`
+still fetches their records.
+
+`db pull` takes the same inputs as a scan (`-p`, `-t`, `-c`, `-m`, list files,
+`--inventory`) and:
 
 - runs a few requests in parallel (`-j`, default 4) with a short pause between
   them, since WPVulnerability is a free service

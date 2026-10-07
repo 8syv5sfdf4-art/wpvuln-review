@@ -34,7 +34,9 @@ pub enum Error {
     VulnApi(String),
 
     /// No input provided (no URL, plugins, themes, or manifest)
-    #[error("no input provided: specify a URL, --plugins, --themes, --core, or --manifest")]
+    #[error(
+        "no input provided: specify a URL, --plugins, --themes, --core, --manifest, or --inventory"
+    )]
     NoInput,
 
     /// Failed to read manifest file

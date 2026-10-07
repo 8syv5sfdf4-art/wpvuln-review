@@ -276,3 +276,100 @@ async fn pull_identifies_itself() {
         .unwrap();
     assert_eq!(summary.saved, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_from_an_inventory_uses_aliases() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(record("")))
+        .mount(&server)
+        .await;
+    let dir = temp_db("inventory");
+    let aliases = dir.with_extension("toml");
+    std::fs::write(
+        &aliases,
+        "[plugin]\n\"chaty-pro2\" = \"chaty\"\n\"hello\" = { theme = \"storefront\" }\n",
+    )
+    .unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wp");
+    let (db_dir, uri) = (dir.clone(), server.uri());
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+            .args(["db", "pull", "-j", "1", "--db"])
+            .arg(&db_dir)
+            .arg("--api-url")
+            .arg(&uri)
+            .arg("--inventory")
+            .arg(&fixture)
+            .arg("--aliases")
+            .arg(&aliases)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    paths.sort();
+    let has = |p: &str| paths.iter().any(|x| x == p);
+    assert!(has("/core/6.6.2/"));
+    assert!(has("/plugin/chaty/"), "alias used: {paths:?}");
+    assert!(!has("/plugin/chaty-pro2/"));
+    assert!(!has("/plugin/hello/"), "covered by the theme");
+    assert!(has("/theme/storefront/"));
+    assert!(
+        has("/plugin/akismet-old/"),
+        "unloaded copies are pulled too"
+    );
+    assert!(
+        has("/plugin/edge-after/"),
+        "no version, but the record is still worth having"
+    );
+    assert!(
+        !has("/plugin/loader/") && !has("/plugin/object-cache/"),
+        "mu-plugins and drop-ins are never looked up"
+    );
+    // Every key exactly once
+    let mut unique = paths.clone();
+    unique.dedup();
+    assert_eq!(unique, paths);
+}
+
+#[test]
+fn scan_from_an_inventory_skips_and_explains_unversioned() {
+    let dir = temp_db("scan-inventory");
+    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wp");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["-o", "json", "--db"])
+        .arg(&dir)
+        .arg("--inventory")
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not checked because no version could be read: edge-after"),
+        "{stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let slugs: Vec<&str> = json["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["slug"].as_str().unwrap())
+        .collect();
+    assert!(slugs.contains(&"chaty-pro2") && slugs.contains(&"wordpress"));
+    assert!(!slugs.contains(&"edge-after") && !slugs.contains(&"loader"));
+}

@@ -76,6 +76,19 @@ struct Inputs {
     /// JSON manifest file (output from wordpress-audit)
     #[arg(long, short = 'm')]
     manifest: Option<PathBuf>,
+
+    /// Inventory to check: inventory.json, or a directory or archive to inventory
+    #[arg(long, value_name = "PATH")]
+    inventory: Option<PathBuf>,
+
+    /// Aliases file mapping inventory folder names to wordpress.org slugs
+    #[arg(
+        long,
+        env = "WPVULN_ALIASES",
+        value_name = "FILE",
+        requires = "inventory"
+    )]
+    aliases: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -162,6 +175,8 @@ enum ListType {
     Core,
 }
 
+// Parsed once per run, so the size difference between variants is irrelevant
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum DbCommand {
     /// Download records for the given components into a local database
@@ -354,10 +369,19 @@ async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<
         return Ok(result);
     }
 
-    Ok(ScanResult::from_components(build_components(&args.inputs)?))
+    Ok(ScanResult::from_components(build_components(
+        &args.inputs,
+        false,
+    )?))
 }
 
-fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+/// Components named by the inputs. Inventory components without a version
+/// are kept for `db pull` (their records are still worth having) but left
+/// out of scans, which cannot match them against version ranges.
+fn build_components(
+    inputs: &Inputs,
+    keep_unversioned: bool,
+) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
     let mut components = Vec::new();
 
     // Manifest file mode
@@ -399,12 +423,71 @@ fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec
         }
     }
 
+    if let Some(ref path) = inputs.inventory {
+        components.extend(inventory_components(
+            path,
+            inputs.aliases.as_deref(),
+            keep_unversioned,
+        )?);
+    }
+
     // Check we have something to scan
     if components.is_empty() {
         return Err(wordpress_vulnerable_scanner::Error::NoInput);
     }
 
     Ok(components)
+}
+
+fn inventory_components(
+    path: &Path,
+    aliases: Option<&Path>,
+    keep_unversioned: bool,
+) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+    let inv = inventory::load(path)?;
+    let aliases = match aliases {
+        Some(p) => Aliases::load(p)?,
+        None => Aliases::default(),
+    };
+    let s = Style::stderr();
+    for w in aliases.check(&inv) {
+        eprintln!("{} {w}", s.yellow("warning:"));
+    }
+
+    let mut out = Vec::new();
+    if let Some(version) = inv.core.as_ref().and_then(|c| c.version.clone()) {
+        out.push(ComponentInfo {
+            component_type: ComponentType::Core,
+            slug: "wordpress".to_string(),
+            version: Some(version),
+        });
+    }
+    let mut unversioned = Vec::new();
+    for l in wordpress_vulnerable_scanner::aliases::lookups(&inv, &aliases) {
+        if l.version.is_none() && !keep_unversioned {
+            unversioned.push(l.slug);
+            continue;
+        }
+        out.push(ComponentInfo {
+            component_type: match l.kind {
+                Kind::Theme => ComponentType::Theme,
+                _ => ComponentType::Plugin,
+            },
+            slug: l.slug,
+            version: l.version,
+        });
+    }
+    if !unversioned.is_empty() {
+        eprintln!(
+            "{} {} not checked because no version could be read: {}. Without a version \
+             they cannot be compared with vulnerable version ranges; the inventory warnings \
+             say why each one has none.\n",
+            s.yellow("note:"),
+            unversioned.len(),
+            unversioned.join(", ")
+        );
+    }
+    Ok(out)
 }
 
 fn read_manifest(
@@ -489,7 +572,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             jobs,
             max_age,
         } => {
-            let items: Vec<(ComponentType, String)> = build_components(inputs)?
+            let items: Vec<(ComponentType, String)> = build_components(inputs, true)?
                 .into_iter()
                 .filter_map(|c| match c.component_type {
                     ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
