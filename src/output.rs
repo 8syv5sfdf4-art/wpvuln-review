@@ -329,6 +329,7 @@ fn add_vulnerability_row(
     let vuln_desc = format!("{}: {}", vuln.id, title);
 
     let fixed = match (vuln.fixed_in.as_deref(), vuln.affected_max.as_deref()) {
+        _ if vuln.unfixed => "no fix yet".to_string(),
         (Some(f), _) => format!(">={}", f), // "< X": X is the first fixed version
         (None, Some(m)) => format!(">{}", m), // "<= X": fixed after X
         _ => "-".to_string(),
