@@ -110,6 +110,10 @@ pub struct ComponentVulnerabilities {
     /// Why it was not checked, or what to keep in mind about the result
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// For a component not checked because of its name: the slug the
+    /// local database does track, to put in aliases.toml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_alias: Option<String>,
 }
 
 impl ComponentVulnerabilities {
@@ -210,6 +214,10 @@ pub struct Analysis {
     pub components: Vec<ComponentVulnerabilities>,
     /// Overall summary
     pub summary: VulnerabilitySummary,
+    /// Problems with the scan's own setup (aliases, inventory), each saying
+    /// what it means and what to do
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Analysis {
@@ -286,6 +294,7 @@ impl Analyzer {
             scan_date: chrono_lite_now(),
             components,
             summary,
+            warnings: Vec::new(),
         }
     }
 
@@ -353,6 +362,16 @@ impl Analyzer {
             }
         };
 
+        let (note, suggested_alias) = match state {
+            ComponentState::Untracked | ComponentState::NotInDb
+                if component.installed_as.is_none()
+                    && component.component_type != ComponentType::Core =>
+            {
+                self.name_hint(component, state, note)
+            }
+            _ => (note, None),
+        };
+
         let max_severity = vulnerabilities.iter().map(|v| v.severity).max();
         ComponentVulnerabilities {
             component_type: component.component_type,
@@ -364,6 +383,52 @@ impl Analyzer {
             matched_via: via,
             installed_as: component.installed_as.clone(),
             note,
+            suggested_alias,
+        }
+    }
+
+    /// Is the component unchecked only because of its name (a renamed,
+    /// premium or backup copy)? With a local database the variants are
+    /// checked there; otherwise the note says how to find out.
+    fn name_hint(
+        &self,
+        component: &ComponentInfo,
+        state: ComponentState,
+        note: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let variants = crate::aliases::name_variants(&component.slug);
+        let table = match component.component_type {
+            ComponentType::Theme => "theme",
+            _ => "plugin",
+        };
+        if let crate::vulnerability::Source::Local(dir) = self.client.source() {
+            for (variant, why) in &variants {
+                if let crate::db::Known::Tracked(n) =
+                    crate::db::known(dir, component.component_type, variant)
+                {
+                    return (
+                        Some(format!(
+                            "probably installed under another name: the database tracks \
+                             \"{variant}\" ({n} record{}; {why}). If it is the same {table}, add \
+                             `\"{}\" = \"{variant}\"` to the [{table}] table of aliases.toml",
+                            if n == 1 { "" } else { "s" },
+                            component.slug
+                        )),
+                        Some(variant.clone()),
+                    );
+                }
+            }
+        }
+        match variants.last() {
+            Some((variant, _)) => (
+                Some(format!(
+                    "{}; the name looks like a renamed, premium or backup copy of \"{variant}\": \
+                     run `aliases suggest --online` to check",
+                    note.unwrap_or_else(|| state.label().to_string())
+                )),
+                None,
+            ),
+            None => (note, None),
         }
     }
 }

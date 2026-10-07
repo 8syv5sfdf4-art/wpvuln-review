@@ -12,7 +12,7 @@ use wordpress_vulnerable_scanner::{
     changes::{Change, ChangeKind},
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
-    output::{OutputConfig, OutputFormat, output_analysis},
+    output::{OutputConfig, OutputFormat, output_analysis, wrap},
     scanner::{
         ComponentInfo, ComponentType, ScanResult, Scanner, parse_component, parse_component_list,
     },
@@ -415,7 +415,7 @@ async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitC
     let output_config = &OutputConfig::new(args.output_format.into(), args.min_severity.into())
         .with_color(Style::stdout().0);
     // Build scan result from various input sources
-    let scan_result = build_scan_result(args).await?;
+    let (scan_result, warnings) = build_scan_result(args).await?;
 
     let source = match args.db {
         Some(ref dir) => Source::Local(dir.clone()),
@@ -424,7 +424,8 @@ async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitC
 
     // Analyze for vulnerabilities
     let analyzer = Analyzer::with_source(source)?;
-    let analysis = analyzer.analyze(&scan_result).await;
+    let mut analysis = analyzer.analyze(&scan_result).await;
+    analysis.warnings = warnings;
 
     // Output results
     let stdout = std::io::stdout();
@@ -480,7 +481,9 @@ fn exit_code(
     }
 }
 
-async fn build_scan_result(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ScanResult> {
+async fn build_scan_result(
+    args: &ScanArgs,
+) -> wordpress_vulnerable_scanner::Result<(ScanResult, Vec<String>)> {
     // URL scan mode
     if let Some(ref url) = args.url {
         // Add http:// if no scheme provided
@@ -491,20 +494,24 @@ async fn build_scan_result(args: &ScanArgs) -> wordpress_vulnerable_scanner::Res
         };
         let scanner = Scanner::new(&url)?;
         let result = scanner.scan().await?;
-        return Ok(result);
+        return Ok((result, Vec::new()));
     }
 
-    Ok(ScanResult::from_components(build_components(&args.inputs)?))
+    let (components, warnings) = build_components(&args.inputs)?;
+    Ok((ScanResult::from_components(components), warnings))
 }
 
-/// Components named by the inputs
-fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+/// Components named by the inputs, and warnings about the inputs
+fn build_components(
+    inputs: &Inputs,
+) -> wordpress_vulnerable_scanner::Result<(Vec<ComponentInfo>, Vec<String>)> {
+    let mut warnings = Vec::new();
     let mut components = Vec::new();
 
     // Manifest file mode
     if let Some(ref manifest_path) = inputs.manifest {
         read_manifest(manifest_path, &mut components)?;
-        return Ok(components);
+        return Ok((components, warnings));
     }
 
     // Direct input mode
@@ -542,7 +549,9 @@ fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec
     }
 
     if let Some(ref path) = inputs.inventory {
-        components.extend(inventory_components(path, inputs.aliases.as_deref())?);
+        let (found, found_warnings) = inventory_components(path, inputs.aliases.as_deref())?;
+        components.extend(found);
+        warnings = found_warnings;
     }
 
     // Check we have something to scan
@@ -550,22 +559,23 @@ fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec
         return Err(wordpress_vulnerable_scanner::Error::NoInput);
     }
 
-    Ok(components)
+    Ok((components, warnings))
 }
 
+/// Components to look up for an inventory, and the warnings that go with
+/// it: alias entries that cannot work, then what the inventory itself
+/// could not resolve
 fn inventory_components(
     path: &Path,
     aliases: Option<&Path>,
-) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+) -> wordpress_vulnerable_scanner::Result<(Vec<ComponentInfo>, Vec<String>)> {
     let inv = inventory::load(path)?;
     let aliases = match aliases {
         Some(p) => Aliases::load(p)?,
         None => Aliases::default(),
     };
-    let s = Style::stderr();
-    for w in aliases.check(&inv) {
-        eprintln!("{} {w}", s.yellow("warning:"));
-    }
+    let mut warnings = aliases.check(&inv);
+    warnings.extend(inv.warnings.iter().map(|w| format!("inventory: {w}")));
 
     let mut out = Vec::new();
     if let Some(version) = inv.core.as_ref().and_then(|c| c.version.clone()) {
@@ -587,7 +597,7 @@ fn inventory_components(
             version: l.version,
         });
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
 fn read_manifest(
@@ -675,7 +685,8 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             jobs,
             max_age,
         } => {
-            let items: Vec<(ComponentType, String)> = build_components(inputs)?
+            let (components, warnings) = build_components(inputs)?;
+            let items: Vec<(ComponentType, String)> = components
                 .into_iter()
                 .filter_map(|c| match c.component_type {
                     ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
@@ -688,7 +699,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 max_age: (*max_age > 0).then(|| Duration::from_secs(max_age * 3600)),
                 ..PullOptions::default()
             };
-            pull_cli("Pulling", dir, &items, &opts).await
+            pull_cli("Pulling", dir, &items, &opts, &warnings).await
         }
         DbCommand::Update {
             db: dir,
@@ -712,7 +723,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 untracked_max_age: hours(*untracked_max_age),
                 ..PullOptions::default()
             };
-            pull_cli("Updating", dir, &items, &opts).await
+            pull_cli("Updating", dir, &items, &opts, &[]).await
         }
         DbCommand::Verify {
             db: dir,
@@ -823,6 +834,7 @@ async fn pull_cli(
     dir: &Path,
     items: &[(ComponentType, String)],
     opts: &PullOptions,
+    warnings: &[String],
 ) -> wordpress_vulnerable_scanner::Result<ExitCode> {
     let s = Style::stdout();
     let total = items.len();
@@ -844,7 +856,9 @@ async fn pull_cli(
     );
 
     let started = Instant::now();
+    let mut outcomes: Vec<(ComponentType, String, PullStatus)> = Vec::new();
     let summary = db::pull(dir, items, opts, |e: &PullEvent| {
+        outcomes.push((e.kind, e.key.clone(), e.status.clone()));
         let (mark, detail) = match &e.status {
             PullStatus::Saved(0) => (s.green("✓"), s.dim("tracked, no known vulnerabilities")),
             PullStatus::Saved(n) => (
@@ -907,13 +921,8 @@ async fn pull_cli(
         started.elapsed(),
         parts.join(", ")
     );
-    if summary.failed > 0 {
-        println!(
-            "{}",
-            s.yellow("Re-run the same command to retry the failed ones; saved records are kept.")
-        );
-    }
     print_changes(&s, dir, &summary.changes, verb == "Updating");
+    print_pull_problems(&s, dir, &outcomes, warnings);
     println!(
         "Scan offline with: {}",
         s.bold(&format!(
@@ -934,16 +943,17 @@ fn verify_cli(
     inventory: Option<&Path>,
     aliases: Option<&Path>,
 ) -> wordpress_vulnerable_scanner::Result<ExitCode> {
-    let needed: Vec<(ComponentType, String)> = match inventory {
-        Some(path) => inventory_components(path, aliases)?
-            .into_iter()
-            .filter_map(|c| match c.component_type {
-                ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
-                kind => Some((kind, c.slug)),
-            })
-            .collect(),
-        None => Vec::new(),
+    let (components, warnings) = match inventory {
+        Some(path) => inventory_components(path, aliases)?,
+        None => (Vec::new(), Vec::new()),
     };
+    let needed: Vec<(ComponentType, String)> = components
+        .into_iter()
+        .filter_map(|c| match c.component_type {
+            ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
+            kind => Some((kind, c.slug)),
+        })
+        .collect();
     let v = db::verify(dir, &needed);
     let s = Style::stdout();
     println!("{} {}", s.bold("Verifying"), dir.display());
@@ -996,6 +1006,7 @@ fn verify_cli(
                 .unwrap_or_default()
         );
     }
+    print_input_warnings(&s, &warnings);
     if v.ok() {
         println!(
             "\n{}",
@@ -1004,6 +1015,159 @@ fn verify_cli(
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(1))
+    }
+}
+
+/// After a pull: what could not be checked and why, which names look like
+/// renamed copies (and whether this database tracks the original), what
+/// failed, and any warnings about the inputs, each with what to do
+fn print_pull_problems(
+    s: &Style,
+    dir: &Path,
+    outcomes: &[(ComponentType, String, PullStatus)],
+    warnings: &[String],
+) {
+    let kind_label = |k: ComponentType| match k {
+        ComponentType::Core => "core ",
+        ComponentType::Plugin => "",
+        ComponentType::Theme => "theme ",
+    };
+    let table = |k: ComponentType| match k {
+        ComponentType::Theme => "theme",
+        _ => "plugin",
+    };
+
+    let mut confirmed = Vec::new();
+    let mut maybe = Vec::new();
+    let mut unknown = Vec::new();
+    for (kind, key, status) in outcomes {
+        if *status != PullStatus::NoData {
+            continue;
+        }
+        let variants = match kind {
+            ComponentType::Core => Vec::new(),
+            _ => wordpress_vulnerable_scanner::aliases::name_variants(key),
+        };
+        let tracked = variants
+            .iter()
+            .find_map(|(v, _)| match db::known(dir, *kind, v) {
+                db::Known::Tracked(n) => Some((v.clone(), n)),
+                _ => None,
+            });
+        match (tracked, variants.is_empty()) {
+            (Some((v, n)), _) => confirmed.push(format!(
+                "{}{key:<40} \"{key}\" = \"{v}\"   (in [{}]; {n} record{} under \"{v}\")",
+                kind_label(*kind),
+                table(*kind),
+                if n == 1 { "" } else { "s" }
+            )),
+            (None, false) => maybe.push(format!(
+                "{}{key}: maybe {}",
+                kind_label(*kind),
+                variants
+                    .iter()
+                    .map(|(v, _)| format!("\"{v}\""))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )),
+            (None, true) => unknown.push(format!("{}{key}", kind_label(*kind))),
+        }
+    }
+    let failed: Vec<String> = outcomes
+        .iter()
+        .filter_map(|(kind, key, status)| match status {
+            PullStatus::Failed(why) => Some(format!("{}{key}: {why}", kind_label(*kind))),
+            _ => None,
+        })
+        .collect();
+    let invalid: Vec<String> = outcomes
+        .iter()
+        .filter(|(_, _, status)| *status == PullStatus::Invalid)
+        .map(|(kind, key, _)| format!("{}{key:?}", kind_label(*kind)))
+        .collect();
+
+    let not_tracked = confirmed.len() + maybe.len() + unknown.len();
+    if not_tracked > 0 {
+        println!(
+            "\n{} ({not_tracked}): WPVulnerability has no entry under these names, so a scan \
+             cannot check them",
+            s.yellow("Not tracked")
+        );
+        if !confirmed.is_empty() {
+            println!(
+                "  {} ({}): this database tracks them under another slug. If they are the same \
+                 plugin, add these lines to aliases.toml and pull again:",
+                s.bold("probably a naming problem"),
+                confirmed.len()
+            );
+            for line in &confirmed {
+                println!("    {line}");
+            }
+        }
+        if !maybe.is_empty() {
+            println!(
+                "  {} ({}): the name looks like a renamed, premium or backup copy, but the \
+                 original is not in this database. To check:\n    \
+                 wordpress-vulnerable-scanner aliases suggest <inventory> --db {} --online",
+                s.bold("maybe a naming problem"),
+                maybe.len(),
+                dir.display()
+            );
+            for line in &maybe {
+                println!("    {line}");
+            }
+        }
+        if !unknown.is_empty() {
+            println!(
+                "  {} ({}): no other name to try. Usually custom or marketplace code that no \
+                 database covers; scans will list it as not checked, so review it by hand:\n    {}",
+                s.bold("not tracked"),
+                unknown.len(),
+                unknown.join(", ")
+            );
+        }
+    }
+    if !failed.is_empty() {
+        println!(
+            "\n{} ({}): nothing was saved for these, and scans will list them as not in the \
+             database. Re-run the same command to retry; saved records are kept.",
+            s.red("Failed"),
+            failed.len()
+        );
+        for line in &failed {
+            println!("    {line}");
+        }
+    }
+    if !invalid.is_empty() {
+        println!(
+            "\n{} ({}): these are not usable slugs (only letters, digits, '-', '_' and '.'), so \
+             they were never requested. Fix the name in the input, or map it in aliases.toml:\n    {}",
+            s.red("Invalid names"),
+            invalid.len(),
+            invalid.join(", ")
+        );
+    }
+    print_input_warnings(s, warnings);
+}
+
+/// Numbered, wrapped "Warnings about the inputs" section on stdout
+fn print_input_warnings(s: &Style, warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    println!(
+        "\n{} ({})",
+        s.yellow("Warnings about the inputs"),
+        warnings.len()
+    );
+    let digits = warnings.len().to_string().len();
+    let indent = " ".repeat(digits + 4);
+    for (i, w) in warnings.iter().enumerate() {
+        println!(
+            "  {:>digits$}. {}",
+            i + 1,
+            wrap(w, 96 - indent.len()).join(&format!("\n{indent}"))
+        );
     }
 }
 
@@ -1228,23 +1392,6 @@ async fn run_aliases(cmd: &AliasesCommand) -> wordpress_vulnerable_scanner::Resu
         suggestions.len() - confirmed - without
     );
     Ok(ExitCode::SUCCESS)
-}
-
-/// Greedy word wrap for terminal messages
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines = vec![String::new()];
-    for word in text.split_whitespace() {
-        let line = lines.last_mut().expect("never empty");
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            lines.push(word.to_string());
-        } else {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-    }
-    lines
 }
 
 fn ago(unix: u64) -> String {

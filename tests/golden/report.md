@@ -4,7 +4,7 @@ Scanned: 2026-10-07T00:00:00Z
 
 ## Summary
 
-**3 vulnerabilities** (1 critical, 1 high, 0 medium, 1 low) in 2 components. **4 components were not checked** and are not known to be safe.
+**3 vulnerabilities** (1 critical, 1 high, 0 medium, 1 low) in 2 components. **5 components were not checked** and are not known to be safe.
 
 | State | Components |
 |---|---|
@@ -12,7 +12,7 @@ Scanned: 2026-10-07T00:00:00Z
 | vulnerable through an alias (confirm) | 1 |
 | clean | 3 |
 | not checked: not tracked | 1 |
-| not checked: not in the local database | 1 |
+| not checked: not in the local database | 2 |
 | not checked: version unknown | 1 |
 | not checked: lookup failed | 1 |
 
@@ -46,6 +46,15 @@ These were looked up under another slug. Premium editions may number their versi
 
 Nothing is known about these: they are neither safe nor vulnerable as far as this scan can tell. Review them by hand.
 
+### Probably a naming problem (1)
+
+The database tracks these under another slug. If they are the same, add the lines to `aliases.toml`:
+
+```toml
+[plugin]
+"hello-dolly2" = "hello-dolly"   # hello-dolly2 1.6.0
+```
+
 ### Not tracked by the data source (common for premium and custom code) (1)
 
 - zhaket-woo-sep 1.2.1
@@ -61,6 +70,10 @@ Nothing is known about these: they are neither safe nor vulnerable as far as thi
 ### Lookup failed (run the scan again) (1)
 
 - broken 1.0: not a valid WPVulnerability response (blocked, or a damaged record)
+
+## Warnings (1)
+
+1. aliases [plugin] "gone-plugin": no installed plugin has this slug, so the alias does nothing. Remove it if the plugin was uninstalled.
 
 ## Clean (3)
 

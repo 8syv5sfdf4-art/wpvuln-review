@@ -107,6 +107,17 @@
     },
     {
       "component_type": "plugin",
+      "slug": "hello-dolly2",
+      "version": "1.6.0",
+      "vulnerabilities": [],
+      "max_severity": null,
+      "state": "not_in_db",
+      "matched_via": "slug",
+      "note": "probably installed under another name: the database tracks \"hello-dolly\" (0 records; dropped trailing digits). If it is the same plugin, add `\"hello-dolly2\" = \"hello-dolly\"` to the [plugin] table of aliases.toml",
+      "suggested_alias": "hello-dolly"
+    },
+    {
+      "component_type": "plugin",
       "slug": "zhaket-woo-sep",
       "version": "1.2.1",
       "vulnerabilities": [],
@@ -161,15 +172,18 @@
     "medium": 0,
     "low": 1,
     "total": 3,
-    "not_checked": 4,
+    "not_checked": 5,
     "components": {
       "vulnerable": 1,
       "alias_match": 1,
       "clean": 3,
       "untracked": 1,
-      "not_in_db": 1,
+      "not_in_db": 2,
       "unknown_version": 1,
       "failed": 1
     }
-  }
+  },
+  "warnings": [
+    "aliases [plugin] \"gone-plugin\": no installed plugin has this slug, so the alias does nothing. Remove it if the plugin was uninstalled."
+  ]
 }

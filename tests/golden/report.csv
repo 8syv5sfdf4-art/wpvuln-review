@@ -1,11 +1,12 @@
-type,component,looked_up_as,version,state,matched_via,id,cves,title,severity,cvss,affected,fixed_in,known_exploited,cwes,references,note
-core,wordpress,wordpress,6.6.2,clean,slug,,,,,,,,,,,
-plugin,akismet,akismet,5.3,vulnerable,slug,CVE-2026-0001,CVE-2026-0001,"Akismet <= 5.3 – Unauthenticated RCE | ""quoted"", with comma",Critical,9.8,">= 5.0, < 5.3.1",5.3.1,true,CWE-94,https://www.cve.org/CVERecord?id=CVE-2026-0001 https://example.org/wf-1,
-plugin,akismet,akismet,5.3,vulnerable,slug,u-low,,Akismet info leak,Low,3.1,<= 9.9,no fix yet,,,,
-plugin,chaty-pro2,chaty-pro,3.3.6,alias_match,alias,CVE-2026-6251,CVE-2026-6251,Chaty Pro < 3.5.6 - SQL Injection,High,7.5,< 3.5.6,3.5.6,,CWE-89,https://www.cve.org/CVERecord?id=CVE-2026-6251,"installed as chaty-pro2, looked up as chaty-pro; premium editions may number versions differently"
-plugin,hello-dolly,hello-dolly,1.7.2,clean,slug,,,,,,,,,,,
-plugin,zhaket-woo-sep,zhaket-woo-sep,1.2.1,untracked,slug,,,,,,,,,,,the data source has no entry for it (common for premium and custom code)
-plugin,never-pulled,never-pulled,1.0,not_in_db,slug,,,,,,,,,,,never pulled into the local database; run `db pull` with the same inputs
-plugin,custom-thing,custom-thing,,unknown_version,slug,,,,,,,,,,,no version could be read; 1 known vulnerability affects some versions
-plugin,broken,broken,1.0,failed,slug,,,,,,,,,,,"not a valid WPVulnerability response (blocked, or a damaged record)"
-theme,storefront,storefront,4.5.0,clean,slug,,,,,,,,,,,
+type,component,looked_up_as,version,state,matched_via,id,cves,title,severity,cvss,affected,fixed_in,known_exploited,cwes,references,note,suggested_alias
+core,wordpress,wordpress,6.6.2,clean,slug,,,,,,,,,,,,
+plugin,akismet,akismet,5.3,vulnerable,slug,CVE-2026-0001,CVE-2026-0001,"Akismet <= 5.3 – Unauthenticated RCE | ""quoted"", with comma",Critical,9.8,">= 5.0, < 5.3.1",5.3.1,true,CWE-94,https://www.cve.org/CVERecord?id=CVE-2026-0001 https://example.org/wf-1,,
+plugin,akismet,akismet,5.3,vulnerable,slug,u-low,,Akismet info leak,Low,3.1,<= 9.9,no fix yet,,,,,
+plugin,chaty-pro2,chaty-pro,3.3.6,alias_match,alias,CVE-2026-6251,CVE-2026-6251,Chaty Pro < 3.5.6 - SQL Injection,High,7.5,< 3.5.6,3.5.6,,CWE-89,https://www.cve.org/CVERecord?id=CVE-2026-6251,"installed as chaty-pro2, looked up as chaty-pro; premium editions may number versions differently",
+plugin,hello-dolly,hello-dolly,1.7.2,clean,slug,,,,,,,,,,,,
+plugin,hello-dolly2,hello-dolly2,1.6.0,not_in_db,slug,,,,,,,,,,,"probably installed under another name: the database tracks ""hello-dolly"" (0 records; dropped trailing digits). If it is the same plugin, add `""hello-dolly2"" = ""hello-dolly""` to the [plugin] table of aliases.toml",hello-dolly
+plugin,zhaket-woo-sep,zhaket-woo-sep,1.2.1,untracked,slug,,,,,,,,,,,the data source has no entry for it (common for premium and custom code),
+plugin,never-pulled,never-pulled,1.0,not_in_db,slug,,,,,,,,,,,never pulled into the local database; run `db pull` with the same inputs,
+plugin,custom-thing,custom-thing,,unknown_version,slug,,,,,,,,,,,no version could be read; 1 known vulnerability affects some versions,
+plugin,broken,broken,1.0,failed,slug,,,,,,,,,,,"not a valid WPVulnerability response (blocked, or a damaged record)",
+theme,storefront,storefront,4.5.0,clean,slug,,,,,,,,,,,,

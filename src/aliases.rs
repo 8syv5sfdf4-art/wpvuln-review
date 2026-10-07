@@ -323,6 +323,25 @@ pub use crate::db::Known;
 const SUFFIXES: [&str; 6] = ["--", "-old", "-main", "-master", "-premium", "-pro"];
 
 /// One renaming step towards a wordpress.org slug, with its reason
+/// wordpress.org slugs a folder name may stand for, closest first, each
+/// with how it was derived: lowercased, then `-premium`, `-pro`, `-old`,
+/// `-main`, `-master`, `--` and trailing digits stripped one at a time
+pub fn name_variants(slug: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut current = slug.to_ascii_lowercase();
+    let mut steps = Vec::new();
+    if current != slug {
+        steps.push("lowercased".to_string());
+        out.push((current.clone(), steps.join(", ")));
+    }
+    while let Some((next, why)) = strip_once(&current) {
+        steps.push(why);
+        out.push((next.clone(), steps.join(", ")));
+        current = next;
+    }
+    out
+}
+
 fn strip_once(slug: &str) -> Option<(String, String)> {
     for suffix in SUFFIXES {
         if let Some(rest) = slug.strip_suffix(suffix)
@@ -381,16 +400,8 @@ pub fn candidates(inv: &Inventory, c: &Component) -> Vec<Candidate> {
             add(own, slug, format!("{header} points to wordpress.org"));
         }
     }
-    let mut slug = c.slug.to_ascii_lowercase();
-    let mut steps = Vec::new();
-    if slug != c.slug {
-        steps.push("lowercased".to_string());
-        add(own, slug.clone(), steps.join(", "));
-    }
-    while let Some((next, why)) = strip_once(&slug) {
-        steps.push(why);
-        add(own, next.clone(), steps.join(", "));
-        slug = next;
+    for (variant, why) in name_variants(&c.slug) {
+        add(own, variant, why);
     }
     if let Some(td) = c.text_domain.as_deref() {
         add(

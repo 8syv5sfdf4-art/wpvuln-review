@@ -67,6 +67,8 @@ async fn analysis() -> Analysis {
         c(Plugin, "akismet", Some("5.3"), None),
         c(Plugin, "chaty-pro", Some("3.3.6"), Some("chaty-pro2")),
         c(Plugin, "hello-dolly", Some("1.7.2"), None),
+        // a renamed copy whose original the database tracks
+        c(Plugin, "hello-dolly2", Some("1.6.0"), None),
         c(Plugin, "zhaket-woo-sep", Some("1.2.1"), None),
         c(Plugin, "never-pulled", Some("1.0"), None),
         c(Plugin, "custom-thing", None, None),
@@ -78,6 +80,11 @@ async fn analysis() -> Analysis {
         .analyze(&scan)
         .await;
     a.scan_date = "2026-10-07T00:00:00Z".to_string();
+    a.warnings = vec![
+        "aliases [plugin] \"gone-plugin\": no installed plugin has this slug, so the alias \
+         does nothing. Remove it if the plugin was uninstalled."
+            .to_string(),
+    ];
     a
 }
 
@@ -137,7 +144,9 @@ async fn json_report() {
 async fn markdown_report() {
     let a = analysis().await;
     let md = render(&a, OutputFormat::Markdown);
-    assert!(md.contains("**4 components were not checked**"));
+    assert!(md.contains("**5 components were not checked**"));
+    assert!(md.contains("```toml\n[plugin]\n\"hello-dolly2\" = \"hello-dolly\""));
+    assert!(md.contains("## Warnings (1)"));
     assert!(md.contains("RCE \\| \"quoted\""), "pipes escaped in tables");
     golden("report.md", &md);
 }
@@ -287,7 +296,24 @@ async fn defectdojo_report_uses_only_accepted_fields() {
                 .any(|t| t == "not-checked")
         })
         .count();
-    assert_eq!((findings.len(), not_checked), (3 + 4, 4));
+    assert_eq!((findings.len(), not_checked), (3 + 5, 5));
+    let renamed = findings
+        .iter()
+        .find(|f| f["component_name"] == "hello-dolly2")
+        .unwrap();
+    assert!(
+        renamed["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "naming-problem")
+    );
+    assert!(
+        json["description"]
+            .as_str()
+            .unwrap()
+            .contains("1 warning(s)")
+    );
     let crit = findings
         .iter()
         .find(|f| f["cve"] == "CVE-2026-0001")

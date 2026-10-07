@@ -1,5 +1,5 @@
 {
-  "description": "Scan of an inventory: 3 vulnerabilities (1 critical, 1 high, 0 medium, 1 low); 4 of 9 components could not be checked (Info findings tagged not-checked).",
+  "description": "Scan of an inventory: 3 vulnerabilities (1 critical, 1 high, 0 medium, 1 low); 5 of 10 components could not be checked (Info findings tagged not-checked); 1 warning(s) about the scan's inputs: aliases [plugin] \"gone-plugin\": no installed plugin has this slug, so the alias does nothing. Remove it if the plugin was uninstalled.",
   "findings": [
     {
       "active": true,
@@ -69,6 +69,22 @@
       "unique_id_from_tool": "plugin/chaty-pro2/u-high",
       "verified": false,
       "vuln_id_from_tool": "u-high"
+    },
+    {
+      "active": true,
+      "component_name": "hello-dolly2",
+      "component_version": "1.6.0",
+      "description": "**Component:** plugin `hello-dolly2` version 1.6.0\n\nThis component could not be compared with vulnerability data: probably installed under another name: the database tracks \"hello-dolly\" (0 records; dropped trailing digits). If it is the same plugin, add `\"hello-dolly2\" = \"hello-dolly\"` to the [plugin] table of aliases.toml. Suggested aliases.toml line: \"hello-dolly2\" = \"hello-dolly\". It is not known to be safe; review it by hand.",
+      "severity": "Info",
+      "tags": [
+        "wordpress",
+        "plugin",
+        "naming-problem",
+        "not-checked"
+      ],
+      "title": "Not checked: hello-dolly2 1.6.0 (not in the local database)",
+      "unique_id_from_tool": "not-checked/plugin/hello-dolly2",
+      "verified": false
     },
     {
       "active": true,

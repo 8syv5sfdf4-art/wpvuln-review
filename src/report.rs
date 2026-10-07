@@ -48,7 +48,7 @@ fn csv_field(text: &str) -> String {
     }
 }
 
-const CSV_HEADER: [&str; 17] = [
+const CSV_HEADER: [&str; 18] = [
     "type",
     "component",
     "looked_up_as",
@@ -66,6 +66,7 @@ const CSV_HEADER: [&str; 17] = [
     "cwes",
     "references",
     "note",
+    "suggested_alias",
 ];
 
 /// One row per finding, and one row for each component without findings
@@ -82,6 +83,7 @@ pub fn write_csv<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -> Res
             serde_name(c.matched_via),
         ];
         let note = c.note.clone().unwrap_or_default();
+        let suggested = c.suggested_alias.clone().unwrap_or_default();
         let findings = shown_findings(c, min);
         let rows: Vec<[String; 11]> = if findings.is_empty() {
             vec![[
@@ -121,6 +123,7 @@ pub fn write_csv<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -> Res
             let fields: Vec<String> = base
                 .iter()
                 .chain(row.iter())
+                .chain(std::iter::once(&suggested))
                 .map(|f| csv_field(f))
                 .collect();
             writeln!(w, "{}", fields.join(","))?;
@@ -273,6 +276,43 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
             "Nothing is known about these: they are neither safe nor vulnerable as far as this \
              scan can tell. Review them by hand.\n"
         )?;
+        let renamed: Vec<_> = analysis
+            .components
+            .iter()
+            .filter(|c| c.suggested_alias.is_some())
+            .collect();
+        if !renamed.is_empty() {
+            writeln!(
+                w,
+                "### Probably a naming problem ({})\n\nThe database tracks these under another \
+                 slug. If they are the same, add the lines to `aliases.toml`:\n\n```toml",
+                renamed.len()
+            )?;
+            for (kind, table) in [
+                (ComponentType::Plugin, "plugin"),
+                (ComponentType::Theme, "theme"),
+            ] {
+                let rows: Vec<_> = renamed
+                    .iter()
+                    .filter(|c| c.component_type == kind)
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                writeln!(w, "[{table}]")?;
+                for c in rows {
+                    writeln!(
+                        w,
+                        "\"{}\" = \"{}\"   # {} {}",
+                        c.slug,
+                        c.suggested_alias.as_deref().unwrap_or_default(),
+                        md_name(c),
+                        c.version.as_deref().unwrap_or("")
+                    )?;
+                }
+            }
+            writeln!(w, "```\n")?;
+        }
         for (state, heading) in [
             (
                 ComponentState::Untracked,
@@ -291,18 +331,28 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
             let hits: Vec<_> = analysis
                 .components
                 .iter()
-                .filter(|c| c.state == state)
+                .filter(|c| c.state == state && c.suggested_alias.is_none())
                 .collect();
             if hits.is_empty() {
                 continue;
             }
             writeln!(w, "### {heading} ({})\n", hits.len())?;
             for c in hits {
+                let looks_renamed = c
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("looks like a renamed"));
                 let detail = match state {
                     ComponentState::UnknownVersion | ComponentState::Failed => c
                         .note
                         .as_deref()
                         .map(|n| format!(": {n}"))
+                        .unwrap_or_default(),
+                    _ if looks_renamed => c
+                        .note
+                        .as_deref()
+                        .and_then(|n| n.split_once("; the name "))
+                        .map(|(_, rest)| format!(": the name {rest}"))
                         .unwrap_or_default(),
                     _ => String::new(),
                 };
@@ -311,6 +361,14 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
             }
             writeln!(w)?;
         }
+    }
+
+    if !analysis.warnings.is_empty() {
+        writeln!(w, "## Warnings ({})\n", analysis.warnings.len())?;
+        for warning in &analysis.warnings {
+            writeln!(w, "1. {}", warning.replace('\n', " "))?;
+        }
+        writeln!(w)?;
     }
 
     let clean: Vec<String> = analysis
@@ -461,10 +519,17 @@ pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W)
         }
 
         if !c.state.checked() {
-            let reason = c
+            let mut reason = c
                 .note
                 .clone()
                 .unwrap_or_else(|| c.state.label().to_string());
+            if let Some(ref slug) = c.suggested_alias {
+                tags.push("naming-problem".to_string());
+                reason = format!(
+                    "{reason}. Suggested aliases.toml line: \"{}\" = \"{slug}\"",
+                    c.slug
+                );
+            }
             let mut not_checked = tags.clone();
             not_checked.push("not-checked".to_string());
             findings.push(json!({
@@ -494,11 +559,14 @@ pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W)
         "version": env!("CARGO_PKG_VERSION"),
         "description": format!(
             "Scan of {}: {} vulnerabilities ({} critical, {} high, {} medium, {} low); \
-             {} of {} components could not be checked (Info findings tagged not-checked).",
+             {} of {} components could not be checked (Info findings tagged not-checked); \
+             {} warning(s) about the scan's inputs: {}",
             analysis.url.as_deref().unwrap_or("an inventory"),
             s.total, s.critical, s.high, s.medium, s.low,
             s.not_checked,
-            analysis.components.len()
+            analysis.components.len(),
+            analysis.warnings.len(),
+            analysis.warnings.join(" | ")
         ),
         "findings": findings,
     });
