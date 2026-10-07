@@ -22,6 +22,7 @@ fn lookup(kind: Kind, slug: &str, version: Option<&str>, via: MatchedVia) -> Opt
         slug: slug.to_string(),
         version: version.map(str::to_string),
         matched_via: via,
+        installed: String::new(),
     })
 }
 
@@ -41,7 +42,14 @@ const ALIASES: &str = r#"
 fn resolves_own_slugs_aliases_and_cross_type_targets() {
     let inv = fixture();
     let a = Aliases::parse(ALIASES).unwrap();
-    let r = |kind, slug| a.resolve(&inv, find(&inv, kind, slug));
+    // `installed` is always the component's own slug; compare the rest
+    let r = |kind, slug| {
+        a.resolve(&inv, find(&inv, kind, slug)).map(|mut l| {
+            assert_eq!(l.installed, slug);
+            l.installed.clear();
+            l
+        })
+    };
 
     use MatchedVia::*;
     assert_eq!(

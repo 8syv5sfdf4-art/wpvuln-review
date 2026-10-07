@@ -33,6 +33,10 @@ pub struct ComponentInfo {
     pub slug: String,
     /// Detected version (if found)
     pub version: Option<String>,
+    /// Set when `slug` was looked up through an alias: the slug the
+    /// component is installed under (its folder name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_as: Option<String>,
 }
 
 /// Type of WordPress component
@@ -140,6 +144,7 @@ impl Scanner {
                 component_type: ComponentType::Core,
                 slug: "wordpress".to_string(),
                 version: Some(version),
+                installed_as: None,
             });
         }
 
@@ -258,6 +263,7 @@ impl Scanner {
                 component_type: ComponentType::Theme,
                 slug,
                 version: None,
+                installed_as: None,
             });
         }
 
@@ -276,6 +282,7 @@ impl Scanner {
             component_type: ComponentType::Theme,
             slug,
             version,
+            installed_as: None,
         })
     }
 
@@ -304,6 +311,7 @@ impl Scanner {
                     component_type: ComponentType::Plugin,
                     slug,
                     version,
+                    installed_as: None,
                 }
             })
             .collect()
@@ -358,11 +366,13 @@ pub fn parse_component(s: &str, component_type: ComponentType) -> Result<Compone
             component_type,
             slug: parts[0].trim().to_string(),
             version: None,
+            installed_as: None,
         }),
         2 => Ok(ComponentInfo {
             component_type,
             slug: parts[0].trim().to_string(),
             version: Some(parts[1].trim().to_string()),
+            installed_as: None,
         }),
         _ => match component_type {
             ComponentType::Plugin => Err(Error::InvalidPluginFormat(s.to_string())),

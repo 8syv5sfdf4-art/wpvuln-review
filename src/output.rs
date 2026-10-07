@@ -1,6 +1,6 @@
 //! Output formatting for vulnerability scan results
 
-use crate::analyze::{Analysis, ComponentVulnerabilities};
+use crate::analyze::{Analysis, ComponentState, ComponentVulnerabilities};
 use crate::error::{Error, Result};
 use crate::vulnerability::Severity;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
@@ -92,9 +92,20 @@ fn output_human<W: Write>(
         writeln!(writer)?;
     }
 
+    let summary = &analysis.summary;
     // Check if any vulnerabilities found
-    if !analysis.summary.has_any() {
-        writeln!(writer, "No vulnerabilities found.")?;
+    if !summary.has_any() {
+        if summary.not_checked == 0 {
+            writeln!(writer, "No vulnerabilities found.")?;
+            return Ok(());
+        }
+        writeln!(
+            writer,
+            "No vulnerabilities found in the {} components that could be checked.\n",
+            analysis.components.len() - summary.not_checked
+        )?;
+        write_not_checked(analysis, writer)?;
+        write_summary(analysis, writer)?;
         return Ok(());
     }
 
@@ -162,16 +173,131 @@ fn output_human<W: Write>(
         writeln!(writer)?;
     }
 
-    // Summary
+    write_alias_notes(analysis, writer)?;
+    write_not_checked(analysis, writer)?;
+    write_summary(analysis, writer)?;
+    Ok(())
+}
+
+/// Name of a component as shown in reports: installed slug, plus what it
+/// was looked up as when that differs
+fn display_name(c: &ComponentVulnerabilities) -> String {
+    let base = match (c.component_type, c.installed_as.as_deref()) {
+        (crate::scanner::ComponentType::Core, _) => "WordPress".to_string(),
+        (_, Some(installed)) => format!("{installed} (as {})", c.slug),
+        (_, None) => c.slug.clone(),
+    };
+    match c.component_type {
+        crate::scanner::ComponentType::Theme => format!("Theme: {base}"),
+        _ => base,
+    }
+}
+
+/// Findings that came through an alias need a human to confirm them
+fn write_alias_notes<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
+    let via_alias: Vec<_> = analysis
+        .components
+        .iter()
+        .filter(|c| c.state == ComponentState::AliasMatch)
+        .collect();
+    if via_alias.is_empty() {
+        return Ok(());
+    }
     writeln!(
         writer,
-        "Summary: {} Critical, {} High, {} Medium, {} Low",
-        analysis.summary.critical,
-        analysis.summary.high,
-        analysis.summary.medium,
-        analysis.summary.low
+        "{}",
+        colorize(
+            "Found through an alias, confirm before acting",
+            Color::Yellow
+        )
     )?;
+    for c in via_alias {
+        writeln!(
+            writer,
+            "  {} {}: premium editions may number versions differently",
+            display_name(c),
+            c.version.as_deref().unwrap_or("-")
+        )?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
 
+/// Everything that was not compared with any data, grouped by why: these
+/// are neither safe nor vulnerable as far as this scan knows
+fn write_not_checked<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
+    if analysis.summary.not_checked == 0 {
+        return Ok(());
+    }
+    writeln!(
+        writer,
+        "{}",
+        colorize(
+            &format!(
+                "NOT CHECKED ({}): not known to be safe, review by hand",
+                analysis.summary.not_checked
+            ),
+            Color::Yellow
+        )
+    )?;
+    for (state, why) in [
+        (
+            ComponentState::Untracked,
+            "the data source has no entry (common for premium and custom code)",
+        ),
+        (
+            ComponentState::NotInDb,
+            "never pulled into the local database; run `db pull` with the same inputs",
+        ),
+        (
+            ComponentState::UnknownVersion,
+            "no version could be read, so ranges cannot be compared",
+        ),
+        (
+            ComponentState::Failed,
+            "the lookup failed; run the scan again",
+        ),
+    ] {
+        let hits: Vec<_> = analysis
+            .components
+            .iter()
+            .filter(|c| c.state == state)
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        writeln!(writer, "  {} ({}): {why}", state.label(), hits.len())?;
+        for c in hits {
+            let detail = match state {
+                ComponentState::UnknownVersion | ComponentState::Failed => c
+                    .note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            writeln!(writer, "    {}{detail}", display_name(c))?;
+        }
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_summary<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
+    let s = &analysis.summary;
+    let n = &s.components;
+    writeln!(
+        writer,
+        "Summary: {} Critical, {} High, {} Medium, {} Low; {} components: {} vulnerable, {} clean, {} not checked",
+        s.critical,
+        s.high,
+        s.medium,
+        s.low,
+        analysis.components.len(),
+        n.vulnerable + n.alias_match,
+        n.clean,
+        s.not_checked
+    )?;
     Ok(())
 }
 
@@ -181,11 +307,7 @@ fn add_vulnerability_row(
     component: &ComponentVulnerabilities,
     vuln: &crate::vulnerability::Vulnerability,
 ) {
-    let component_name = match component.component_type {
-        crate::scanner::ComponentType::Core => "WordPress".to_string(),
-        crate::scanner::ComponentType::Plugin => component.slug.clone(),
-        crate::scanner::ComponentType::Theme => format!("Theme: {}", component.slug),
-    };
+    let component_name = display_name(component);
 
     let version = component.version.as_deref().unwrap_or("-");
 

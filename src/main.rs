@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
-    aliases::Aliases,
+    aliases::{Aliases, MatchedVia},
     changes::{Change, ChangeKind},
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
@@ -384,10 +384,7 @@ async fn run_scan(
     let scan_result = build_scan_result(args).await?;
 
     let source = match args.db {
-        Some(ref dir) => {
-            warn_missing(dir, &scan_result.components);
-            Source::Local(dir.clone())
-        }
+        Some(ref dir) => Source::Local(dir.clone()),
         None => Source::Api(args.api_url.clone()),
     };
 
@@ -410,39 +407,6 @@ async fn run_scan(
     })
 }
 
-/// In offline mode, a component missing from the database would silently
-/// look clean; say so on stderr instead.
-fn warn_missing(dir: &Path, components: &[ComponentInfo]) {
-    let keys = components.iter().filter_map(|c| match c.component_type {
-        ComponentType::Core => c.version.as_deref().map(|v| (c.component_type, v)),
-        _ => Some((c.component_type, c.slug.as_str())),
-    });
-    let keys: Vec<_> = keys.collect();
-    let untracked = db::untracked(dir, keys.iter().copied());
-    if !untracked.is_empty() {
-        let s = Style::stderr();
-        eprintln!(
-            "{} {} not tracked by WPVulnerability, so not checked (common for premium/custom plugins): {}\n",
-            s.yellow("note:"),
-            untracked.len(),
-            untracked.join(", ")
-        );
-    }
-    let missing = db::missing(dir, keys.iter().copied());
-    if !missing.is_empty() {
-        let s = Style::stderr();
-        eprintln!(
-            "{} {} not in the local database (reported as clean): {}",
-            s.yellow("warning:"),
-            missing.len(),
-            missing.join(", ")
-        );
-        eprintln!(
-            "         run `wordpress-vulnerable-scanner db pull` with the same inputs to add them\n"
-        );
-    }
-}
-
 async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<ScanResult> {
     // URL scan mode
     if let Some(ref url) = args.url {
@@ -457,19 +421,11 @@ async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<
         return Ok(result);
     }
 
-    Ok(ScanResult::from_components(build_components(
-        &args.inputs,
-        false,
-    )?))
+    Ok(ScanResult::from_components(build_components(&args.inputs)?))
 }
 
-/// Components named by the inputs. Inventory components without a version
-/// are kept for `db pull` (their records are still worth having) but left
-/// out of scans, which cannot match them against version ranges.
-fn build_components(
-    inputs: &Inputs,
-    keep_unversioned: bool,
-) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+/// Components named by the inputs
+fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
     let mut components = Vec::new();
 
     // Manifest file mode
@@ -484,6 +440,7 @@ fn build_components(
             component_type: ComponentType::Core,
             slug: "wordpress".to_string(),
             version: Some(core_version.clone()),
+            installed_as: None,
         });
     }
 
@@ -512,11 +469,7 @@ fn build_components(
     }
 
     if let Some(ref path) = inputs.inventory {
-        components.extend(inventory_components(
-            path,
-            inputs.aliases.as_deref(),
-            keep_unversioned,
-        )?);
+        components.extend(inventory_components(path, inputs.aliases.as_deref())?);
     }
 
     // Check we have something to scan
@@ -530,7 +483,6 @@ fn build_components(
 fn inventory_components(
     path: &Path,
     aliases: Option<&Path>,
-    keep_unversioned: bool,
 ) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
     let inv = inventory::load(path)?;
     let aliases = match aliases {
@@ -548,32 +500,19 @@ fn inventory_components(
             component_type: ComponentType::Core,
             slug: "wordpress".to_string(),
             version: Some(version),
+            installed_as: None,
         });
     }
-    let mut unversioned = Vec::new();
     for l in wordpress_vulnerable_scanner::aliases::lookups(&inv, &aliases) {
-        if l.version.is_none() && !keep_unversioned {
-            unversioned.push(l.slug);
-            continue;
-        }
         out.push(ComponentInfo {
             component_type: match l.kind {
                 Kind::Theme => ComponentType::Theme,
                 _ => ComponentType::Plugin,
             },
+            installed_as: (l.matched_via == MatchedVia::Alias).then_some(l.installed),
             slug: l.slug,
             version: l.version,
         });
-    }
-    if !unversioned.is_empty() {
-        eprintln!(
-            "{} {} not checked because no version could be read: {}. Without a version \
-             they cannot be compared with vulnerable version ranges; the inventory warnings \
-             say why each one has none.\n",
-            s.yellow("note:"),
-            unversioned.len(),
-            unversioned.join(", ")
-        );
     }
     Ok(out)
 }
@@ -612,6 +551,7 @@ fn read_manifest(
             component_type: ComponentType::Core,
             slug: "wordpress".to_string(),
             version: Some(version.to_string()),
+            installed_as: None,
         });
     }
 
@@ -629,6 +569,7 @@ fn read_manifest(
             component_type: ComponentType::Theme,
             slug: name.to_string(),
             version,
+            installed_as: None,
         });
     }
 
@@ -645,6 +586,7 @@ fn read_manifest(
                 component_type: ComponentType::Plugin,
                 slug: slug.clone(),
                 version,
+                installed_as: None,
             });
         }
     }
@@ -660,7 +602,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             jobs,
             max_age,
         } => {
-            let items: Vec<(ComponentType, String)> = build_components(inputs, true)?
+            let items: Vec<(ComponentType, String)> = build_components(inputs)?
                 .into_iter()
                 .filter_map(|c| match c.component_type {
                     ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
@@ -920,7 +862,7 @@ fn verify_cli(
     aliases: Option<&Path>,
 ) -> wordpress_vulnerable_scanner::Result<ExitCode> {
     let needed: Vec<(ComponentType, String)> = match inventory {
-        Some(path) => inventory_components(path, aliases, true)?
+        Some(path) => inventory_components(path, aliases)?
             .into_iter()
             .filter_map(|c| match c.component_type {
                 ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),

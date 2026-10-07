@@ -67,6 +67,8 @@ pub struct Lookup {
     pub version: Option<String>,
     /// Own slug or alias
     pub matched_via: MatchedVia,
+    /// Slug the component is installed under
+    pub installed: String,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +124,7 @@ impl Aliases {
                 slug: c.slug.clone(),
                 version: c.version.clone(),
                 matched_via: MatchedVia::Slug,
+                installed: c.slug.clone(),
             });
         };
         let version = if target.kind == own {
@@ -135,6 +138,7 @@ impl Aliases {
             slug: target.slug.clone(),
             version,
             matched_via: MatchedVia::Alias,
+            installed: c.slug.clone(),
         })
     }
 
@@ -267,13 +271,16 @@ fn convert(
 /// Everything to look up for an inventory: each plugin, unloaded plugin
 /// and theme, resolved through `aliases`. Must-use plugins and drop-ins
 /// are never looked up. Identical lookups (say, a plugin covered by a
-/// theme that is checked anyway) appear once.
+/// theme that is checked anyway) appear once, under the first component
+/// that needs them.
 pub fn lookups(inv: &Inventory, aliases: &Aliases) -> Vec<Lookup> {
     let mut out: Vec<Lookup> = Vec::new();
     for c in &inv.components {
-        if let Some(l) = aliases.resolve(inv, c)
-            && !out.contains(&l)
-        {
+        let Some(l) = aliases.resolve(inv, c) else {
+            continue;
+        };
+        let same = |o: &Lookup| o.kind == l.kind && o.slug == l.slug && o.version == l.version;
+        if !out.iter().any(same) {
             out.push(l);
         }
     }
