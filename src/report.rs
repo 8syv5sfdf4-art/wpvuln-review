@@ -329,3 +329,180 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
     }
     Ok(())
 }
+
+/// An f32 as the decimal number it was written as (9.8, not
+/// 9.800000190734863 after widening to f64)
+fn decimal(value: f32, places: usize) -> f64 {
+    format!("{value:.places$}").parse().unwrap_or_default()
+}
+
+/// Title limit of DefectDojo's Generic Findings Import
+const DOJO_TITLE_MAX: usize = 511;
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max.saturating_sub(3)).collect();
+        format!("{cut}...")
+    }
+}
+
+/// DefectDojo's Generic Findings Import JSON (fields as documented for
+/// DefectDojo 3; any other key would abort the import). Every finding
+/// becomes one DefectDojo finding. Every component that could not be
+/// checked becomes an Info finding tagged `not-checked`, so it stays
+/// visible in the tracker instead of disappearing.
+pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -> Result<()> {
+    use serde_json::{Map, Value, json};
+
+    let mut findings = Vec::new();
+    for c in &analysis.components {
+        let name = installed_name(c);
+        let version = c.version.as_deref().unwrap_or("unknown");
+        let kind = kind_name(c.component_type);
+        let mut tags = vec!["wordpress".to_string(), kind.to_string()];
+        if c.state == ComponentState::AliasMatch {
+            tags.push("alias-match".to_string());
+        }
+
+        for v in shown_findings(c, min) {
+            let mut f = Map::new();
+            let mut put = |k: &str, v: Value| {
+                f.insert(k.to_string(), v);
+            };
+            put(
+                "title",
+                json!(truncate(
+                    &format!("{name} {version}: {}", v.title),
+                    DOJO_TITLE_MAX
+                )),
+            );
+            put("severity", json!(v.severity.to_string()));
+            let mut description = vec![
+                format!("**Component:** {kind} `{name}` version {version}"),
+                format!("**Affected versions:** {}", v.affected),
+            ];
+            if let Some(ref d) = v.description {
+                description.push(d.clone());
+            }
+            if let Some(ref note) = c.note {
+                description.push(format!("**Note:** {note}"));
+            }
+            put("description", json!(description.join("\n\n")));
+            if let Some(cve) = v.cves.first() {
+                put("cve", json!(cve));
+            }
+            if v.cves.len() > 1 {
+                put("vulnerability_ids", json!(v.cves[1..]));
+            }
+            if let Some(ref vector) = v.cvss_vector
+                && vector.starts_with("CVSS:3.")
+            {
+                put("cvssv3", json!(vector));
+            }
+            if let Some(score) = v.cvss_score {
+                put("cvssv3_score", json!(decimal(score, 1)));
+                put(
+                    "severity_justification",
+                    json!(format!("CVSS {score:.1} as published by the data source")),
+                );
+            } else {
+                put(
+                    "severity_justification",
+                    json!("No CVSS score published; Medium assumed"),
+                );
+            }
+            if let Some(cwe) = v
+                .cwes
+                .first()
+                .and_then(|c| c.trim_start_matches("CWE-").parse::<u32>().ok())
+            {
+                put("cwe", json!(cwe));
+            }
+            put("component_name", json!(truncate(name, 500)));
+            put("component_version", json!(truncate(version, 100)));
+            if !v.references.is_empty() {
+                put("references", json!(v.references.join("\n")));
+            }
+            let fix = (!v.unfixed).then_some(v.fixed_in.as_deref()).flatten();
+            put("fix_available", json!(fix.is_some()));
+            match fix {
+                Some(fixed) => {
+                    put("fix_version", json!(truncate(fixed, 100)));
+                    put(
+                        "mitigation",
+                        json!(format!("Update {name} to {fixed} or later.")),
+                    );
+                }
+                None => put(
+                    "mitigation",
+                    json!(format!(
+                        "No fixed version is known. Disable or remove {name} if it is not \
+                         needed, and watch for an update."
+                    )),
+                ),
+            }
+            if v.known_exploited == Some(true) {
+                put("known_exploited", json!(true));
+            }
+            if let Some(epss) = v.epss {
+                put("epss_score", json!(decimal(epss, 4)));
+            }
+            put(
+                "unique_id_from_tool",
+                json!(truncate(&format!("{kind}/{name}/{}", v.uuid), 500)),
+            );
+            put("vuln_id_from_tool", json!(truncate(&v.uuid, 500)));
+            put("active", json!(true));
+            put("verified", json!(false));
+            put("tags", json!(tags));
+            findings.push(Value::Object(f));
+        }
+
+        if !c.state.checked() {
+            let reason = c
+                .note
+                .clone()
+                .unwrap_or_else(|| c.state.label().to_string());
+            let mut not_checked = tags.clone();
+            not_checked.push("not-checked".to_string());
+            findings.push(json!({
+                "title": truncate(
+                    &format!("Not checked: {name} {version} ({})", c.state.label()),
+                    DOJO_TITLE_MAX
+                ),
+                "severity": "Info",
+                "description": format!(
+                    "**Component:** {kind} `{name}` version {version}\n\n\
+                     This component could not be compared with vulnerability data: {reason}. \
+                     It is not known to be safe; review it by hand."
+                ),
+                "component_name": truncate(name, 500),
+                "component_version": truncate(version, 100),
+                "unique_id_from_tool": truncate(&format!("not-checked/{kind}/{name}"), 500),
+                "active": true,
+                "verified": false,
+                "tags": not_checked,
+            }));
+        }
+    }
+
+    let s = &analysis.summary;
+    let report = json!({
+        "type": "WordPress Vulnerable Scanner",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": format!(
+            "Scan of {}: {} vulnerabilities ({} critical, {} high, {} medium, {} low); \
+             {} of {} components could not be checked (Info findings tagged not-checked).",
+            analysis.url.as_deref().unwrap_or("an inventory"),
+            s.total, s.critical, s.high, s.medium, s.low,
+            s.not_checked,
+            analysis.components.len()
+        ),
+        "findings": findings,
+    });
+    serde_json::to_writer_pretty(&mut *w, &report)?;
+    writeln!(w)?;
+    Ok(())
+}

@@ -19,6 +19,8 @@ pub enum OutputFormat {
     Csv,
     /// Markdown report for people
     Markdown,
+    /// DefectDojo Generic Findings Import JSON
+    DefectDojo,
     /// No output (silent mode)
     None,
 }
@@ -32,6 +34,7 @@ impl FromStr for OutputFormat {
             "json" => Ok(Self::Json),
             "csv" => Ok(Self::Csv),
             "markdown" | "md" => Ok(Self::Markdown),
+            "defectdojo" => Ok(Self::DefectDojo),
             "none" => Ok(Self::None),
             _ => Err(Error::InvalidOutputFormat(s.to_string())),
         }
@@ -89,6 +92,9 @@ pub fn output_analysis<W: Write>(
         OutputFormat::Csv => crate::report::write_csv(analysis, config.min_severity, writer),
         OutputFormat::Markdown => {
             crate::report::write_markdown(analysis, config.min_severity, writer)
+        }
+        OutputFormat::DefectDojo => {
+            crate::report::write_defectdojo(analysis, config.min_severity, writer)
         }
         OutputFormat::None => Ok(()),
     }

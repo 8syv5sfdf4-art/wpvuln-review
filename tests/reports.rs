@@ -159,3 +159,142 @@ async fn csv_report_accounts_for_every_component() {
     assert_eq!(crit[13], "true");
     golden("report.csv", &csv);
 }
+
+/// Finding keys DefectDojo's Generic Findings Import accepts (from its
+/// documentation); any other key makes it reject the whole file
+const DOJO_FINDING_KEYS: &[&str] = &[
+    "title",
+    "severity",
+    "description",
+    "date",
+    "cwe",
+    "cwes",
+    "cve",
+    "vulnerability_ids",
+    "epss_score",
+    "epss_percentile",
+    "cvssv3",
+    "cvssv3_score",
+    "cvssv4",
+    "cvssv4_score",
+    "mitigation",
+    "impact",
+    "steps_to_reproduce",
+    "severity_justification",
+    "references",
+    "active",
+    "verified",
+    "false_p",
+    "out_of_scope",
+    "risk_accepted",
+    "under_review",
+    "is_mitigated",
+    "mitigated",
+    "thread_id",
+    "param",
+    "payload",
+    "line",
+    "file_path",
+    "component_name",
+    "component_version",
+    "static_finding",
+    "dynamic_finding",
+    "scanner_confidence",
+    "unique_id_from_tool",
+    "vuln_id_from_tool",
+    "sast_source_object",
+    "sast_sink_object",
+    "sast_source_line",
+    "sast_source_file_path",
+    "nb_occurences",
+    "publish_date",
+    "service",
+    "planned_remediation_date",
+    "planned_remediation_version",
+    "effort_for_fixing",
+    "kev_date",
+    "known_exploited",
+    "ransomware_used",
+    "fix_available",
+    "fix_version",
+    "tags",
+    "endpoints",
+    "files",
+    "numerical_severity",
+];
+const DOJO_REPORT_KEYS: &[&str] = &[
+    "findings",
+    "type",
+    "name",
+    "version",
+    "description",
+    "static_tool",
+    "dynamic_tool",
+];
+const DOJO_BOOL_KEYS: &[&str] = &[
+    "active",
+    "verified",
+    "false_p",
+    "out_of_scope",
+    "risk_accepted",
+    "under_review",
+    "is_mitigated",
+    "static_finding",
+    "dynamic_finding",
+    "known_exploited",
+    "ransomware_used",
+    "fix_available",
+];
+
+#[tokio::test]
+async fn defectdojo_report_uses_only_accepted_fields() {
+    let a = analysis().await;
+    let text = render(&a, OutputFormat::DefectDojo);
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for key in json.as_object().unwrap().keys() {
+        assert!(DOJO_REPORT_KEYS.contains(&key.as_str()), "report key {key}");
+    }
+    let findings = json["findings"].as_array().unwrap();
+    for f in findings {
+        for (key, value) in f.as_object().unwrap() {
+            assert!(
+                DOJO_FINDING_KEYS.contains(&key.as_str()),
+                "finding key {key}"
+            );
+            if DOJO_BOOL_KEYS.contains(&key.as_str()) {
+                assert!(value.is_boolean(), "{key} must be a JSON boolean");
+            }
+        }
+        for required in ["title", "severity", "description"] {
+            assert!(f.get(required).is_some(), "{required} missing: {f}");
+        }
+        let sev = f["severity"].as_str().unwrap();
+        assert!(["Critical", "High", "Medium", "Low", "Info"].contains(&sev));
+        assert!(f["title"].as_str().unwrap().chars().count() <= 511);
+        if let Some(cwe) = f.get("cwe") {
+            assert!(cwe.is_u64(), "cwe is a number");
+        }
+    }
+
+    // 3 findings, plus one Info finding per component not checked
+    let not_checked = findings
+        .iter()
+        .filter(|f| {
+            f["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "not-checked")
+        })
+        .count();
+    assert_eq!((findings.len(), not_checked), (3 + 4, 4));
+    let crit = findings
+        .iter()
+        .find(|f| f["cve"] == "CVE-2026-0001")
+        .unwrap();
+    assert_eq!(crit["cve"], "CVE-2026-0001");
+    assert_eq!(crit["known_exploited"], true);
+    assert_eq!(crit["cwe"], 94);
+    assert_eq!(crit["fix_version"], "5.3.1");
+    golden("defectdojo.json", &text);
+}

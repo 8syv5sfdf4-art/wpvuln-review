@@ -358,11 +358,29 @@ health. This applies to live API scans as well as `--db` scans. `--db` and `--ap
 | JSON | `-o json` | Machine-readable JSON, with a `state` per component |
 | CSV | `-o csv` | One row per finding, plus one per component without findings |
 | Markdown | `-o markdown` | Report for people: summary, findings, alias matches, not checked |
+| DefectDojo | `-o defectdojo` | DefectDojo "Generic Findings Import" JSON |
 | None | `-o none` | Silent (exit code only) |
 
 Every format accounts for every component, including the ones that could not
 be checked, with the reason. `--severity` hides lower findings from the human,
 CSV and Markdown reports; JSON always holds everything.
+
+### DefectDojo
+
+```bash
+wordpress-vulnerable-scanner scan --db wpvuln-db --inventory inventory.json \
+    --aliases aliases.toml -o defectdojo > findings.json
+```
+
+Import `findings.json` as scan type **Generic Findings Import**. Only fields
+DefectDojo 3 documents are used, since any other key aborts the import:
+title, severity, description, CVE (and further ids), CVSS v3 vector and score,
+CWE, component name and version, references, fix availability and version,
+mitigation, KEV, EPSS and tags. `unique_id_from_tool` is stable
+(`plugin/<installed slug>/<record uuid>`), so re-imports deduplicate.
+Components that could not be checked become **Info** findings tagged
+`not-checked`, and findings through an alias are tagged `alias-match` and left
+unverified, so neither gets lost in the tracker.
 
 ## Exit Codes
 

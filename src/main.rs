@@ -348,6 +348,8 @@ enum OutputFormatArg {
     Json,
     Csv,
     Markdown,
+    #[value(name = "defectdojo")]
+    DefectDojo,
     None,
 }
 
@@ -358,6 +360,7 @@ impl From<OutputFormatArg> for OutputFormat {
             OutputFormatArg::Json => OutputFormat::Json,
             OutputFormatArg::Csv => OutputFormat::Csv,
             OutputFormatArg::Markdown => OutputFormat::Markdown,
+            OutputFormatArg::DefectDojo => OutputFormat::DefectDojo,
             OutputFormatArg::None => OutputFormat::None,
         }
     }

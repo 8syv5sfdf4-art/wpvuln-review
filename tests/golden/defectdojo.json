@@ -1,0 +1,136 @@
+{
+  "description": "Scan of an inventory: 3 vulnerabilities (1 critical, 1 high, 0 medium, 1 low); 4 of 9 components could not be checked (Info findings tagged not-checked).",
+  "findings": [
+    {
+      "active": true,
+      "component_name": "akismet",
+      "component_version": "5.3",
+      "cve": "CVE-2026-0001",
+      "cvssv3": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvssv3_score": 9.8,
+      "cwe": 94,
+      "description": "**Component:** plugin `akismet` version 5.3\n\n**Affected versions:** >= 5.0, < 5.3.1\n\n[en] Remote code execution.",
+      "fix_available": true,
+      "fix_version": "5.3.1",
+      "known_exploited": true,
+      "mitigation": "Update akismet to 5.3.1 or later.",
+      "references": "https://www.cve.org/CVERecord?id=CVE-2026-0001\nhttps://example.org/wf-1",
+      "severity": "Critical",
+      "severity_justification": "CVSS 9.8 as published by the data source",
+      "tags": [
+        "wordpress",
+        "plugin"
+      ],
+      "title": "akismet 5.3: Akismet <= 5.3 – Unauthenticated RCE | \"quoted\", with comma",
+      "unique_id_from_tool": "plugin/akismet/u-crit",
+      "verified": false,
+      "vuln_id_from_tool": "u-crit"
+    },
+    {
+      "active": true,
+      "component_name": "akismet",
+      "component_version": "5.3",
+      "cvssv3_score": 3.1,
+      "description": "**Component:** plugin `akismet` version 5.3\n\n**Affected versions:** <= 9.9",
+      "fix_available": false,
+      "mitigation": "No fixed version is known. Disable or remove akismet if it is not needed, and watch for an update.",
+      "severity": "Low",
+      "severity_justification": "CVSS 3.1 as published by the data source",
+      "tags": [
+        "wordpress",
+        "plugin"
+      ],
+      "title": "akismet 5.3: Akismet info leak",
+      "unique_id_from_tool": "plugin/akismet/u-low",
+      "verified": false,
+      "vuln_id_from_tool": "u-low"
+    },
+    {
+      "active": true,
+      "component_name": "chaty-pro2",
+      "component_version": "3.3.6",
+      "cve": "CVE-2026-6251",
+      "cvssv3": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+      "cvssv3_score": 7.5,
+      "cwe": 89,
+      "description": "**Component:** plugin `chaty-pro2` version 3.3.6\n\n**Affected versions:** < 3.5.6\n\nSQLi via widget id.\n\n**Note:** installed as chaty-pro2, looked up as chaty-pro; premium editions may number versions differently",
+      "fix_available": true,
+      "fix_version": "3.5.6",
+      "mitigation": "Update chaty-pro2 to 3.5.6 or later.",
+      "references": "https://www.cve.org/CVERecord?id=CVE-2026-6251",
+      "severity": "High",
+      "severity_justification": "CVSS 7.5 as published by the data source",
+      "tags": [
+        "wordpress",
+        "plugin",
+        "alias-match"
+      ],
+      "title": "chaty-pro2 3.3.6: Chaty Pro < 3.5.6 - SQL Injection",
+      "unique_id_from_tool": "plugin/chaty-pro2/u-high",
+      "verified": false,
+      "vuln_id_from_tool": "u-high"
+    },
+    {
+      "active": true,
+      "component_name": "zhaket-woo-sep",
+      "component_version": "1.2.1",
+      "description": "**Component:** plugin `zhaket-woo-sep` version 1.2.1\n\nThis component could not be compared with vulnerability data: the data source has no entry for it (common for premium and custom code). It is not known to be safe; review it by hand.",
+      "severity": "Info",
+      "tags": [
+        "wordpress",
+        "plugin",
+        "not-checked"
+      ],
+      "title": "Not checked: zhaket-woo-sep 1.2.1 (not tracked)",
+      "unique_id_from_tool": "not-checked/plugin/zhaket-woo-sep",
+      "verified": false
+    },
+    {
+      "active": true,
+      "component_name": "never-pulled",
+      "component_version": "1.0",
+      "description": "**Component:** plugin `never-pulled` version 1.0\n\nThis component could not be compared with vulnerability data: never pulled into the local database; run `db pull` with the same inputs. It is not known to be safe; review it by hand.",
+      "severity": "Info",
+      "tags": [
+        "wordpress",
+        "plugin",
+        "not-checked"
+      ],
+      "title": "Not checked: never-pulled 1.0 (not in the local database)",
+      "unique_id_from_tool": "not-checked/plugin/never-pulled",
+      "verified": false
+    },
+    {
+      "active": true,
+      "component_name": "custom-thing",
+      "component_version": "unknown",
+      "description": "**Component:** plugin `custom-thing` version unknown\n\nThis component could not be compared with vulnerability data: no version could be read; 1 known vulnerability affects some versions. It is not known to be safe; review it by hand.",
+      "severity": "Info",
+      "tags": [
+        "wordpress",
+        "plugin",
+        "not-checked"
+      ],
+      "title": "Not checked: custom-thing unknown (version unknown)",
+      "unique_id_from_tool": "not-checked/plugin/custom-thing",
+      "verified": false
+    },
+    {
+      "active": true,
+      "component_name": "broken",
+      "component_version": "1.0",
+      "description": "**Component:** plugin `broken` version 1.0\n\nThis component could not be compared with vulnerability data: not a valid WPVulnerability response (blocked, or a damaged record). It is not known to be safe; review it by hand.",
+      "severity": "Info",
+      "tags": [
+        "wordpress",
+        "plugin",
+        "not-checked"
+      ],
+      "title": "Not checked: broken 1.0 (lookup failed)",
+      "unique_id_from_tool": "not-checked/plugin/broken",
+      "verified": false
+    }
+  ],
+  "type": "WordPress Vulnerable Scanner",
+  "version": "1.0.0"
+}
