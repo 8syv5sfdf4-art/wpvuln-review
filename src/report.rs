@@ -48,7 +48,7 @@ fn csv_field(text: &str) -> String {
     }
 }
 
-const CSV_HEADER: [&str; 18] = [
+const CSV_HEADER: [&str; 19] = [
     "type",
     "component",
     "looked_up_as",
@@ -66,6 +66,7 @@ const CSV_HEADER: [&str; 18] = [
     "cwes",
     "references",
     "note",
+    "sources",
     "suggested_alias",
 ];
 
@@ -85,7 +86,7 @@ pub fn write_csv<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -> Res
         let note = c.note.clone().unwrap_or_default();
         let suggested = c.suggested_alias.clone().unwrap_or_default();
         let findings = shown_findings(c, min);
-        let rows: Vec<[String; 11]> = if findings.is_empty() {
+        let rows: Vec<[String; 12]> = if findings.is_empty() {
             vec![[
                 String::new(),
                 String::new(),
@@ -98,6 +99,7 @@ pub fn write_csv<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -> Res
                 String::new(),
                 String::new(),
                 note,
+                String::new(),
             ]]
         } else {
             findings
@@ -115,6 +117,11 @@ pub fn write_csv<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -> Res
                         v.cwes.join(" "),
                         v.references.join(" "),
                         note.clone(),
+                        v.sources
+                            .iter()
+                            .map(|s| serde_name(*s))
+                            .collect::<Vec<_>>()
+                            .join(" "),
                     ]
                 })
                 .collect()
@@ -371,6 +378,34 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
         writeln!(w)?;
     }
 
+    writeln!(w, "## Sources\n")?;
+    for source in &analysis.sources {
+        writeln!(
+            w,
+            "- {}: {}",
+            crate::analyze::source_name(source.source),
+            source.detail
+        )?;
+    }
+    if !analysis.summary.not_checked_by.is_empty() {
+        writeln!(
+            w,
+            "\nA component counts as not checked only when no source had data for it. Per \
+             source:\n\n| Source | No data for |\n|---|---|"
+        )?;
+        for (source, n) in &analysis.summary.not_checked_by {
+            writeln!(w, "| {} | {n} |", crate::analyze::source_name(*source))?;
+        }
+    }
+    for a in analysis
+        .sources
+        .iter()
+        .filter_map(|s| s.attribution.as_deref())
+    {
+        writeln!(w, "\n{a}")?;
+    }
+    writeln!(w)?;
+
     let clean: Vec<String> = analysis
         .components
         .iter()
@@ -514,7 +549,13 @@ pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W)
             put("vuln_id_from_tool", json!(truncate(&v.uuid, 500)));
             put("active", json!(true));
             put("verified", json!(false));
-            put("tags", json!(tags));
+            let mut finding_tags = tags.clone();
+            finding_tags.extend(
+                v.sources
+                    .iter()
+                    .map(|s| format!("source-{}", serde_name(*s))),
+            );
+            put("tags", json!(finding_tags));
             findings.push(Value::Object(f));
         }
 
@@ -567,7 +608,12 @@ pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W)
             analysis.components.len(),
             analysis.warnings.len(),
             analysis.warnings.join(" | ")
-        ),
+        ) + &analysis
+            .sources
+            .iter()
+            .filter_map(|s| s.attribution.as_deref())
+            .map(|a| format!(" {a}"))
+            .collect::<String>(),
         "findings": findings,
     });
     serde_json::to_writer_pretty(&mut *w, &report)?;

@@ -80,6 +80,9 @@ async fn analysis() -> Analysis {
         .analyze(&scan)
         .await;
     a.scan_date = "2026-10-07T00:00:00Z".to_string();
+    for source in &mut a.sources {
+        source.detail = "test database".to_string();
+    }
     a.warnings = vec![
         "aliases [plugin] \"gone-plugin\": no installed plugin has this slug, so the alias \
          does nothing. Remove it if the plugin was uninstalled."

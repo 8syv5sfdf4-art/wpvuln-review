@@ -67,6 +67,16 @@ struct ScanArgs {
     /// Also exit 1 when any component could not be checked
     #[arg(long)]
     fail_on_unchecked: bool,
+
+    /// Wordfence feed to use: a file, or `auto` for <db>/wordfence/wordfence.json.
+    /// With --db both sources are combined; without it only Wordfence is used,
+    /// with no network access
+    #[arg(long, env = "WPVULN_WORDFENCE", value_name = "FILE|auto")]
+    wordfence: Option<String>,
+
+    /// Report Wordfence's informational records too (as low, marked)
+    #[arg(long)]
+    include_informational: bool,
 }
 
 /// Threshold for `--fail-on`
@@ -506,13 +516,23 @@ async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitC
     // Build scan result from various input sources
     let (scan_result, warnings) = build_scan_result(args).await?;
 
-    let source = match args.db {
-        Some(ref dir) => Source::Local(dir.clone()),
-        None => Source::Api(args.api_url.clone()),
+    let wordfence = match args.wordfence.as_deref() {
+        None => None,
+        Some(spec) => Some(load_wordfence(spec, args.db.as_deref(), &scan_result)?),
     };
-
-    // Analyze for vulnerabilities
-    let analyzer = Analyzer::with_source(source)?;
+    let analyzer = match (args.db.as_ref(), wordfence) {
+        (Some(dir), wf) => {
+            let a = Analyzer::with_source(Source::Local(dir.clone()))?;
+            match wf {
+                Some((index, detail)) => a.with_wordfence(index, detail),
+                None => a,
+            }
+        }
+        // Wordfence alone: no network
+        (None, Some((index, detail))) => Analyzer::wordfence_only(index, detail),
+        (None, None) => Analyzer::with_source(Source::Api(args.api_url.clone()))?,
+    }
+    .include_informational(args.include_informational);
     let mut analysis = analyzer.analyze(&scan_result).await;
     analysis.warnings = warnings;
 
@@ -526,6 +546,58 @@ async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitC
         args.fail_on,
         args.fail_on_unchecked,
     )))
+}
+
+/// Load a Wordfence feed for a scan, keeping only what it can use: the
+/// scanned slugs, their name variants (for naming hints) and core
+fn load_wordfence(
+    spec: &str,
+    db: Option<&Path>,
+    scan: &ScanResult,
+) -> wordpress_vulnerable_scanner::Result<(WordfenceIndex, String)> {
+    let path = match (spec, db) {
+        ("auto", Some(dir)) => wordfence_db::feed_path(dir),
+        ("auto", None) => {
+            return Err(wordpress_vulnerable_scanner::Error::Wordfence(
+                "--wordfence auto means <db>/wordfence/wordfence.json, so it needs --db; \
+                 or give the feed file's path"
+                    .to_string(),
+            ));
+        }
+        (file, _) => PathBuf::from(file),
+    };
+    if !path.is_file() {
+        return Err(wordpress_vulnerable_scanner::Error::Wordfence(format!(
+            "{}: no feed there. Run `db wordfence pull --db <dir>` first, or give the path \
+             of a downloaded feed.",
+            path.display()
+        )));
+    }
+    let mut keep = std::collections::HashSet::new();
+    keep.insert((ComponentType::Core, "wordpress".to_string()));
+    for c in &scan.components {
+        if c.component_type == ComponentType::Core {
+            continue;
+        }
+        keep.insert((c.component_type, c.slug.to_ascii_lowercase()));
+        for (variant, _) in wordpress_vulnerable_scanner::aliases::name_variants(&c.slug) {
+            keep.insert((c.component_type, variant));
+        }
+    }
+    let index = WordfenceIndex::load(&path, &Keep::Only(keep))?;
+    let detail = match db.and_then(wordfence_db::read_meta) {
+        Some(m) if path == wordfence_db::feed_path(db.unwrap_or(Path::new(""))) => format!(
+            "{} ({}, pulled {})",
+            path.display(),
+            match m.source {
+                wordfence_db::FeedSource::Github => "GitHub wpprobe export",
+                wordfence_db::FeedSource::Api => "Intelligence API",
+            },
+            ago(m.fetched_at)
+        ),
+        _ => path.display().to_string(),
+    };
+    Ok((index, detail))
 }
 
 /// 2 for critical, 1 for other vulnerabilities, 0 otherwise. `fail_on`

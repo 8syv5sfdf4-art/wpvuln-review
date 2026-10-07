@@ -220,5 +220,11 @@
   },
   "warnings": [
     "aliases [plugin] \"gone-plugin\": no installed plugin has this slug, so the alias does nothing. Remove it if the plugin was uninstalled."
+  ],
+  "sources": [
+    {
+      "source": "wpvulnerability",
+      "detail": "test database"
+    }
   ]
 }

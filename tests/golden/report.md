@@ -75,6 +75,10 @@ The database tracks these under another slug. If they are the same, add the line
 
 1. aliases [plugin] "gone-plugin": no installed plugin has this slug, so the alias does nothing. Remove it if the plugin was uninstalled.
 
+## Sources
+
+- WPVulnerability: test database
+
 ## Clean (3)
 
 Tracked, and no known vulnerability affects the installed version: WordPress 6.6.2, hello-dolly 1.7.2, theme storefront 4.5.0

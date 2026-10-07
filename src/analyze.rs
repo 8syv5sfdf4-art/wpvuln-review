@@ -2,9 +2,12 @@
 
 use crate::aliases::MatchedVia;
 use crate::scanner::{ComponentInfo, ComponentType, ScanResult};
-use crate::vulnerability::{RecordLookup, Severity, Vulnerability, VulnerabilityClient};
+use crate::vulnerability::{
+    RecordLookup, Severity, SourceKind, Vulnerability, VulnerabilityClient, VulnerabilityReport,
+};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// What the scan could say about one component. Exactly one applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -114,6 +117,9 @@ pub struct ComponentVulnerabilities {
     /// local database does track, to put in aliases.toml
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_alias: Option<String>,
+    /// What each source knew about it, when a scan uses several
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub coverage: BTreeMap<SourceKind, Coverage>,
 }
 
 impl ComponentVulnerabilities {
@@ -145,6 +151,9 @@ pub struct VulnerabilitySummary {
     pub not_checked: usize,
     /// Components per state
     pub components: StateCounts,
+    /// With several sources: components each source had no data for
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub not_checked_by: BTreeMap<SourceKind, usize>,
 }
 
 impl VulnerabilitySummary {
@@ -218,6 +227,8 @@ pub struct Analysis {
     /// what it means and what to do
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Data sources used, with the attribution their licenses require
+    pub sources: Vec<SourceInfo>,
 }
 
 impl Analysis {
@@ -243,9 +254,37 @@ impl Analysis {
     }
 }
 
+/// What one source said about a component
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    /// The source knows the component
+    Tracked,
+    /// The source has no entry for it
+    Untracked,
+    /// A local database that never pulled it
+    NotInDb,
+    /// The lookup failed
+    Failed,
+}
+
+/// A data source a scan used, for reports and attribution
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceInfo {
+    /// Which source
+    pub source: SourceKind,
+    /// Where its data came from (API URL, database, feed file)
+    pub detail: String,
+    /// Copyright notice to show with its data, when the license requires one
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
+}
+
 /// Analyzer for scan results
 pub struct Analyzer {
-    client: VulnerabilityClient,
+    client: Option<VulnerabilityClient>,
+    wordfence: Option<(crate::wordfence::WordfenceIndex, String)>,
+    include_informational: bool,
 }
 
 impl Analyzer {
@@ -258,8 +297,61 @@ impl Analyzer {
     /// (a mirror of the API, or a local database directory)
     pub fn with_source(source: crate::vulnerability::Source) -> crate::error::Result<Self> {
         Ok(Self {
-            client: VulnerabilityClient::with_source(source)?,
+            client: Some(VulnerabilityClient::with_source(source)?),
+            wordfence: None,
+            include_informational: false,
         })
+    }
+
+    /// An analyzer that uses only Wordfence data: no network at all
+    pub fn wordfence_only(index: crate::wordfence::WordfenceIndex, detail: String) -> Self {
+        Self {
+            client: None,
+            wordfence: Some((index, detail)),
+            include_informational: false,
+        }
+    }
+
+    /// Also use Wordfence data, next to WPVulnerability
+    pub fn with_wordfence(
+        mut self,
+        index: crate::wordfence::WordfenceIndex,
+        detail: String,
+    ) -> Self {
+        self.wordfence = Some((index, detail));
+        self
+    }
+
+    /// Report Wordfence's informational records (as low, marked) instead
+    /// of skipping them
+    pub fn include_informational(mut self, yes: bool) -> Self {
+        self.include_informational = yes;
+        self
+    }
+
+    /// The sources this analyzer reads, in the order they are consulted
+    pub fn sources(&self) -> Vec<SourceInfo> {
+        let mut out = Vec::new();
+        if let Some(ref client) = self.client {
+            out.push(SourceInfo {
+                source: SourceKind::WpVulnerability,
+                detail: match client.source() {
+                    crate::vulnerability::Source::Api(url) => format!("API {url}"),
+                    crate::vulnerability::Source::Local(dir) => {
+                        format!("local database {}", dir.display())
+                    }
+                },
+                attribution: None,
+            });
+        }
+        if let Some((_, ref detail)) = self.wordfence {
+            out.push(SourceInfo {
+                source: SourceKind::Wordfence,
+                detail: detail.clone(),
+                attribution: Some(crate::wordfence::ATTRIBUTION.to_string()),
+            });
+        }
+        out
     }
 
     /// Analyze scan results for vulnerabilities
@@ -282,6 +374,11 @@ impl Analyzer {
         let mut summary = VulnerabilitySummary::from_refs(&all_vulns);
         for c in &components {
             summary.components.add(c.state);
+            for (source, cov) in &c.coverage {
+                if *cov != Coverage::Tracked {
+                    *summary.not_checked_by.entry(*source).or_default() += 1;
+                }
+            }
         }
         summary.not_checked = summary.components.not_checked();
 
@@ -295,6 +392,7 @@ impl Analyzer {
             components,
             summary,
             warnings: Vec::new(),
+            sources: self.sources(),
         }
     }
 
@@ -305,67 +403,164 @@ impl Analyzer {
         } else {
             MatchedVia::Slug
         };
-        let key = match component.component_type {
-            ComponentType::Core => component.version.as_deref(),
-            _ => Some(component.slug.as_str()),
-        };
-        let looked = match key {
-            Some(key) => self.client.lookup(component.component_type, key).await,
-            // Core is looked up by version, so there is nothing to ask
-            None => RecordLookup::Found(Default::default()),
-        };
+        let kind = component.component_type;
+        let several = self.client.is_some() && self.wordfence.is_some();
 
-        let (state, vulnerabilities, note) = match (looked, component.version.as_deref()) {
-            (RecordLookup::Failed(why), _) => (ComponentState::Failed, Vec::new(), Some(why)),
-            (RecordLookup::Missing, _) => (
+        // Ask every source; keep what each one knows
+        let mut found: Vec<(SourceKind, Vec<Vulnerability>)> = Vec::new();
+        let mut misses: Vec<(SourceKind, ComponentState, String)> = Vec::new();
+        let mut coverage = BTreeMap::new();
+        if let Some(ref client) = self.client {
+            let key = match kind {
+                ComponentType::Core => component.version.as_deref(),
+                _ => Some(component.slug.as_str()),
+            };
+            let looked = match key {
+                Some(key) => client.lookup(kind, key).await,
+                // Core is looked up by version, so there is nothing to ask
+                None => RecordLookup::Found(Default::default()),
+            };
+            let source = SourceKind::WpVulnerability;
+            match looked {
+                RecordLookup::Found(report) => {
+                    coverage.insert(source, Coverage::Tracked);
+                    found.push((source, report.vulnerabilities));
+                }
+                RecordLookup::Untracked => {
+                    coverage.insert(source, Coverage::Untracked);
+                    misses.push((
+                        source,
+                        ComponentState::Untracked,
+                        "the data source has no entry for it (common for premium and custom code)"
+                            .into(),
+                    ));
+                }
+                RecordLookup::Missing => {
+                    coverage.insert(source, Coverage::NotInDb);
+                    misses.push((
+                        source,
+                        ComponentState::NotInDb,
+                        "never pulled into the local database; run `db pull` with the same inputs"
+                            .into(),
+                    ));
+                }
+                RecordLookup::Failed(why) => {
+                    coverage.insert(source, Coverage::Failed);
+                    misses.push((source, ComponentState::Failed, why));
+                }
+            }
+        }
+        if let Some((ref index, _)) = self.wordfence {
+            let slug = match kind {
+                ComponentType::Core => "wordpress",
+                _ => component.slug.as_str(),
+            };
+            let source = SourceKind::Wordfence;
+            match index.lookup(kind, slug) {
+                Some(list) => {
+                    coverage.insert(source, Coverage::Tracked);
+                    let list = list
+                        .iter()
+                        .filter(|v| !v.informational || self.include_informational)
+                        .map(|v| {
+                            let mut v = v.clone();
+                            if v.informational {
+                                v.severity = Severity::Low;
+                                v.title = format!("[informational] {}", v.title);
+                            }
+                            v
+                        })
+                        .collect();
+                    found.push((source, list));
+                }
+                None => {
+                    coverage.insert(source, Coverage::Untracked);
+                    misses.push((
+                        source,
+                        ComponentState::Untracked,
+                        "Wordfence has no entry for it; it lists only software with known \
+                         vulnerabilities, so this is not proof of safety"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        let (state, vulnerabilities, note) = if found.is_empty() {
+            // Nothing to compare with: the most actionable reason wins
+            let state = [
+                ComponentState::Failed,
                 ComponentState::NotInDb,
-                Vec::new(),
-                Some(
-                    "never pulled into the local database; run `db pull` with the same inputs"
-                        .into(),
-                ),
-            ),
-            (RecordLookup::Untracked, _) => (
                 ComponentState::Untracked,
-                Vec::new(),
-                Some(
-                    "the data source has no entry for it (common for premium and custom code)"
-                        .into(),
+            ]
+            .into_iter()
+            .find(|s| misses.iter().any(|(_, m, _)| m == s))
+            .unwrap_or(ComponentState::Untracked);
+            let note = if several {
+                misses
+                    .iter()
+                    .map(|(source, _, why)| format!("{}: {why}", source_name(*source)))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else {
+                misses
+                    .first()
+                    .map(|(_, _, why)| why.clone())
+                    .unwrap_or_default()
+            };
+            (state, Vec::new(), Some(note))
+        } else if let Some(version) = component.version.as_deref() {
+            let mut merged: Vec<Vulnerability> = Vec::new();
+            for (source, list) in &found {
+                let hits = VulnerabilityReport {
+                    vulnerabilities: list.clone(),
+                }
+                .filter_by_version(Some(version))
+                .vulnerabilities;
+                for hit in hits {
+                    merge_finding(&mut merged, hit, *source);
+                }
+            }
+            let state = match (merged.is_empty(), via) {
+                (true, _) => ComponentState::Clean,
+                (false, MatchedVia::Alias) => ComponentState::AliasMatch,
+                (false, MatchedVia::Slug) => ComponentState::Vulnerable,
+            };
+            let mut notes = Vec::new();
+            if via == MatchedVia::Alias {
+                notes.push(format!(
+                    "installed as {}, looked up as {}; premium editions may number versions \
+                     differently",
+                    component.installed_as.as_deref().unwrap_or_default(),
+                    component.slug
+                ));
+            }
+            if several {
+                for (source, _, why) in &misses {
+                    notes.push(format!("{}: {why}", source_name(*source)));
+                }
+            }
+            (state, merged, (!notes.is_empty()).then(|| notes.join("; ")))
+        } else {
+            let mut ids = std::collections::BTreeSet::new();
+            for (_, list) in &found {
+                for v in list {
+                    ids.insert(v.cves.first().cloned().unwrap_or_else(|| v.id.clone()));
+                }
+            }
+            let note = match ids.len() {
+                0 => "no version could be read".to_string(),
+                n => format!(
+                    "no version could be read; {n} known vulnerabilit{} some versions",
+                    if n == 1 { "y affects" } else { "ies affect" }
                 ),
-            ),
-            (RecordLookup::Found(report), None) => {
-                let note = match report.vulnerabilities.len() {
-                    0 => "no version could be read".to_string(),
-                    n => format!(
-                        "no version could be read; {n} known vulnerabilit{} some versions",
-                        if n == 1 { "y affects" } else { "ies affect" }
-                    ),
-                };
-                (ComponentState::UnknownVersion, Vec::new(), Some(note))
-            }
-            (RecordLookup::Found(report), Some(version)) => {
-                let found = report.filter_by_version(Some(version)).vulnerabilities;
-                let state = match (found.is_empty(), via) {
-                    (true, _) => ComponentState::Clean,
-                    (false, MatchedVia::Alias) => ComponentState::AliasMatch,
-                    (false, MatchedVia::Slug) => ComponentState::Vulnerable,
-                };
-                let note = (via == MatchedVia::Alias).then(|| {
-                    format!(
-                        "installed as {}, looked up as {}; premium editions may number versions \
-                         differently",
-                        component.installed_as.as_deref().unwrap_or_default(),
-                        component.slug
-                    )
-                });
-                (state, found, note)
-            }
+            };
+            (ComponentState::UnknownVersion, Vec::new(), Some(note))
         };
 
         let (note, suggested_alias) = match state {
             ComponentState::Untracked | ComponentState::NotInDb
-                if component.installed_as.is_none()
-                    && component.component_type != ComponentType::Core =>
+                if component.installed_as.is_none() && kind != ComponentType::Core =>
             {
                 self.name_hint(component, state, note)
             }
@@ -374,7 +569,7 @@ impl Analyzer {
 
         let max_severity = vulnerabilities.iter().map(|v| v.severity).max();
         ComponentVulnerabilities {
-            component_type: component.component_type,
+            component_type: kind,
             slug: component.slug.clone(),
             version: component.version.clone(),
             vulnerabilities,
@@ -384,12 +579,14 @@ impl Analyzer {
             installed_as: component.installed_as.clone(),
             note,
             suggested_alias,
+            coverage: if several { coverage } else { BTreeMap::new() },
         }
     }
 
     /// Is the component unchecked only because of its name (a renamed,
-    /// premium or backup copy)? With a local database the variants are
-    /// checked there; otherwise the note says how to find out.
+    /// premium or backup copy)? Name variants are looked up in the local
+    /// database and the Wordfence feed; otherwise the note says how to
+    /// find out.
     fn name_hint(
         &self,
         component: &ComponentInfo,
@@ -401,22 +598,44 @@ impl Analyzer {
             ComponentType::Theme => "theme",
             _ => "plugin",
         };
-        if let crate::vulnerability::Source::Local(dir) = self.client.source() {
-            for (variant, why) in &variants {
-                if let crate::db::Known::Tracked(n) =
+        let advice = |variant: &str, who: String, why: &str| {
+            Some(format!(
+                "probably installed under another name: {who} \"{variant}\" ({why}). If it is \
+                 the same {table}, add `\"{}\" = \"{variant}\"` to the [{table}] table of \
+                 aliases.toml",
+                component.slug
+            ))
+        };
+        for (variant, why) in &variants {
+            if let Some(crate::vulnerability::Source::Local(dir)) =
+                self.client.as_ref().map(|c| c.source())
+                && let crate::db::Known::Tracked(n) =
                     crate::db::known(dir, component.component_type, variant)
-                {
-                    return (
-                        Some(format!(
-                            "probably installed under another name: the database tracks \
-                             \"{variant}\" ({n} record{}; {why}). If it is the same {table}, add \
-                             `\"{}\" = \"{variant}\"` to the [{table}] table of aliases.toml",
-                            if n == 1 { "" } else { "s" },
-                            component.slug
-                        )),
-                        Some(variant.clone()),
-                    );
-                }
+            {
+                return (
+                    advice(
+                        variant,
+                        "the database tracks".to_string(),
+                        &format!("{n} record{}; {why}", if n == 1 { "" } else { "s" }),
+                    ),
+                    Some(variant.clone()),
+                );
+            }
+            if let Some((ref index, _)) = self.wordfence
+                && let Some(list) = index.lookup(component.component_type, variant)
+            {
+                let n = list.len();
+                return (
+                    advice(
+                        variant,
+                        "Wordfence tracks".to_string(),
+                        &format!(
+                            "{n} vulnerabilit{}; {why}",
+                            if n == 1 { "y" } else { "ies" }
+                        ),
+                    ),
+                    Some(variant.clone()),
+                );
             }
         }
         match variants.last() {
@@ -430,6 +649,59 @@ impl Analyzer {
             ),
             None => (note, None),
         }
+    }
+}
+
+/// Display name of a source
+pub fn source_name(source: SourceKind) -> &'static str {
+    match source {
+        SourceKind::WpVulnerability => "WPVulnerability",
+        SourceKind::Wordfence => "Wordfence",
+    }
+}
+
+/// Add `hit` (found by `source`) to `merged`: the same CVE from another
+/// source joins the existing finding, which then lists both sources;
+/// findings without a CVE never merge
+fn merge_finding(merged: &mut Vec<Vulnerability>, hit: Vulnerability, source: SourceKind) {
+    let same = hit.cves.first().and_then(|cve| {
+        merged
+            .iter_mut()
+            .find(|m| m.cves.first() == Some(cve) && !m.sources.contains(&source))
+    });
+    let Some(existing) = same else {
+        merged.push(hit);
+        return;
+    };
+    existing.sources.push(source);
+    for r in hit.references {
+        if !existing.references.contains(&r) {
+            existing.references.push(r);
+        }
+    }
+    for c in hit.cves {
+        if !existing.cves.contains(&c) {
+            existing.cves.push(c);
+        }
+    }
+    if existing.cvss_vector.is_none() {
+        existing.cvss_vector = hit.cvss_vector;
+    }
+    if existing.cwes.is_empty() {
+        existing.cwes = hit.cwes;
+    }
+    if existing.description.is_none() {
+        existing.description = hit.description;
+    }
+    if existing.auth.is_none() {
+        existing.auth = hit.auth;
+    }
+    if existing.known_exploited != Some(true) && hit.known_exploited.is_some() {
+        existing.known_exploited = hit.known_exploited;
+    }
+    if existing.fixed_in.is_none() {
+        existing.fixed_in = hit.fixed_in;
+        existing.fixed_branch = hit.fixed_branch;
     }
 }
 
