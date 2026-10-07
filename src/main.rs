@@ -599,6 +599,21 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 Some(ref m) => {
                     println!("  source      {}", m.source);
                     println!("  last pull   {}", ago(m.pulled_at));
+                    match st.indexed {
+                        Some(n) => println!(
+                            "  format      {} (index: {n} records{})",
+                            m.format,
+                            match st.rebuilt {
+                                0 => String::new(),
+                                r => format!(", {r} rebuilt from files, download details unknown"),
+                            }
+                        ),
+                        None => println!(
+                            "  format      {} {}",
+                            m.format,
+                            s.dim("(no index yet; the next `db pull` adds one)")
+                        ),
+                    }
                 }
                 None => println!("  {}", s.yellow("not a database yet; run `db pull` first")),
             }
@@ -613,8 +628,22 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 );
             }
             println!("  records     {}", st.records);
-            if let Some(t) = st.oldest {
-                println!("  oldest file {}", ago(t));
+            match (st.indexed, st.oldest_check, st.oldest) {
+                (Some(_), Some(t), _) => println!("  oldest check {}", ago(t)),
+                (None, _, Some(t)) => println!(
+                    "  oldest file {} {}",
+                    ago(t),
+                    s.dim("(file times reset when a database is copied)")
+                ),
+                _ => {}
+            }
+            if st.unconfirmed > 0 {
+                println!(
+                    "  {} {} never confirmed: rebuilt from files, so when they were fetched is \
+                     unknown. `db update` re-checks them.",
+                    s.yellow("unconfirmed"),
+                    st.unconfirmed
+                );
             }
             Ok(ExitCode::SUCCESS)
         }

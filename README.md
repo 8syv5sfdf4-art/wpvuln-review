@@ -257,15 +257,23 @@ still fetches their records.
   plugins). Not-tracked components are stored too, and offline scans list them
   as "not checked" rather than letting them look clean
 
-Each record is the raw API response, one file per component:
+Each record is the raw API response, one file per component, and `index.json`
+records where each one came from:
 
 ```text
 wpvuln-db/
-├── wpvuln-db.json          # format, source URL, last pull
+├── wpvuln-db.json          # format (2), source URL, last pull
+├── index.json              # per record: fetched/checked time, URL, HTTP status,
+│                           #   sha256, tracked or not, vulnerability uuids, ETag
 ├── plugin/<slug>.json
 ├── theme/<slug>.json
 └── core/<version>.json
 ```
+
+A format 1 database (no index) still works for scans and is migrated by the next
+`db pull`. Records found without an index entry are indexed from the file but
+marked unconfirmed: copying a database resets file times, so nothing says how
+old they are, and the next pull or `db update` re-checks them.
 
 A scan with `--db` prints a note for components that are not tracked and a
 warning for components that were never pulled, since neither has been checked. `--db` and `--api-url`

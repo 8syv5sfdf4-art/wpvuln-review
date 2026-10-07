@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! <dir>/wpvuln-db.json            metadata: format, source, last pull
+//! <dir>/index.json                per record: when, from where, sha256, uuids
 //! <dir>/plugin/<slug>.json
 //! <dir>/theme/<slug>.json
 //! <dir>/core/<version>.json
@@ -24,12 +25,227 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::http::API_USER_AGENT;
 use crate::scanner::ComponentType;
-use crate::vulnerability::{RecordKind, api_url, record_kind};
+use crate::vulnerability::{RecordKind, api_url, record_kind, record_uuids};
 
-/// Database layout version, bumped on incompatible changes
-pub const FORMAT_VERSION: u32 = 1;
+/// Database layout version, bumped on incompatible changes.
+/// 1: records only. 2: adds `index.json`; format 1 is migrated on pull.
+pub const FORMAT_VERSION: u32 = 2;
 
 const META_FILE: &str = "wpvuln-db.json";
+const INDEX_FILE: &str = "index.json";
+
+/// Whether a stored record describes a tracked component
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    /// WPVulnerability knows the component
+    Tracked,
+    /// WPVulnerability has no entry for it: not checked
+    Untracked,
+}
+
+/// Provenance of one stored record
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexEntry {
+    /// Unix time the body was downloaded
+    pub fetched_at: u64,
+    /// Unix time it was last confirmed current (download or HTTP 304);
+    /// 0 for a rebuilt entry, which was never confirmed
+    pub checked_at: u64,
+    /// Where it came from
+    pub url: String,
+    /// HTTP status of the download; `None` for entries rebuilt from files
+    pub http_status: Option<u16>,
+    /// SHA-256 of the stored file, lowercase hex
+    pub sha256: String,
+    /// Tracked or untracked
+    pub kind: EntryKind,
+    /// Number of vulnerability records
+    pub records: usize,
+    /// Vulnerability uuids, sorted, to tell what changed between versions
+    pub uuids: Vec<String>,
+    /// `ETag` from the API, for conditional requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// `Last-Modified` from the API, for conditional requests
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+    /// Rebuilt from a file found without an entry (a format 1 database or
+    /// an interrupted pull), so its download details are unknown
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebuilt: bool,
+}
+
+/// `index.json`: one [`IndexEntry`] per record, keyed `plugin/<slug>`,
+/// `theme/<slug>` or `core/<version>`
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Index {
+    /// Layout version ([`FORMAT_VERSION`])
+    pub format: u32,
+    /// Entries by key
+    pub records: std::collections::BTreeMap<String, IndexEntry>,
+}
+
+/// Index key for one component
+pub fn index_key(kind: ComponentType, key: &str) -> String {
+    format!("{}/{key}", dir_name(kind))
+}
+
+/// SHA-256 as lowercase hex
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Refuse databases written by a newer version of this tool, rather than
+/// misreading them
+fn check_format(dir: &Path) -> Result<()> {
+    let format = std::fs::read_to_string(dir.join(META_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str::<DbMeta>(&s).ok())
+        .map(|m| m.format);
+    match format {
+        Some(f) if f > FORMAT_VERSION => Err(Error::Database(format!(
+            "{} uses format {f}, but this version of the tool only understands up to \
+             {FORMAT_VERSION}. Use a newer wordpress-vulnerable-scanner, or pull into a new \
+             directory.",
+            dir.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Read `index.json`; `None` when there is none yet (a new or format 1
+/// database)
+pub fn read_index(dir: &Path) -> Result<Option<Index>> {
+    let path = dir.join(INDEX_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Database(format!("{}: {e}", path.display()))),
+    };
+    let index: Index = serde_json::from_str(&text).map_err(|e| {
+        Error::Database(format!(
+            "{}: unreadable ({e}). Delete it and run `db pull` again to rebuild it from the \
+             record files.",
+            path.display()
+        ))
+    })?;
+    if index.format > FORMAT_VERSION {
+        return Err(Error::Database(format!(
+            "{}: format {} is newer than this tool understands ({FORMAT_VERSION})",
+            path.display(),
+            index.format
+        )));
+    }
+    Ok(Some(index))
+}
+
+fn write_index(dir: &Path, index: &Index) -> Result<()> {
+    let path = dir.join(INDEX_FILE);
+    let tmp = dir.join(format!("{INDEX_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(index)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Index entry for a stored file that has none, from the file alone.
+/// Copying a database resets file times, so they say nothing about when
+/// a record was fetched: `fetched_at` is only a guess (file time, capped
+/// at the last pull), and `checked_at` is 0 so the record counts as
+/// stale and the next pull or update confirms it.
+fn rebuild_entry(path: &Path, url: String, last_pull: Option<u64>) -> Option<IndexEntry> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let kind = record_kind(&body)?;
+    let mtime = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let guess = last_pull.map_or(mtime, |p| p.min(mtime));
+    let mut entry = entry_for(&body, kind, url, None, None, None, guess, true);
+    entry.checked_at = 0;
+    Some(entry)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entry_for(
+    body: &str,
+    kind: RecordKind,
+    url: String,
+    http_status: Option<u16>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    at: u64,
+    rebuilt: bool,
+) -> IndexEntry {
+    let (kind, records) = match kind {
+        RecordKind::Tracked(n) => (EntryKind::Tracked, n),
+        RecordKind::Untracked => (EntryKind::Untracked, 0),
+    };
+    IndexEntry {
+        fetched_at: at,
+        checked_at: at,
+        url,
+        http_status,
+        sha256: sha256_hex(body.as_bytes()),
+        kind,
+        records,
+        uuids: record_uuids(body),
+        etag,
+        last_modified,
+        rebuilt,
+    }
+}
+
+/// Every record file in `dir`, as (kind, key)
+fn record_files(dir: &Path) -> Vec<(ComponentType, String)> {
+    let mut out = Vec::new();
+    for kind in [
+        ComponentType::Core,
+        ComponentType::Plugin,
+        ComponentType::Theme,
+    ] {
+        let Ok(entries) = std::fs::read_dir(dir.join(dir_name(kind))) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(key) = name.strip_suffix(".json")
+                && is_safe_key(key)
+            {
+                out.push((kind, key.to_string()));
+            }
+        }
+    }
+    out.sort_by(|a, b| (dir_name(a.0), &a.1).cmp(&(dir_name(b.0), &b.1)));
+    out
+}
+
+/// The index, with entries rebuilt for any record file that lacks one.
+/// This is how a format 1 database is migrated.
+fn load_index(dir: &Path, base: &str) -> Result<Index> {
+    let mut index = read_index(dir)?.unwrap_or_default();
+    index.format = FORMAT_VERSION;
+    let last_pull = std::fs::read_to_string(dir.join(META_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str::<DbMeta>(&s).ok())
+        .map(|m| m.pulled_at);
+    for (kind, key) in record_files(dir) {
+        let k = index_key(kind, &key);
+        if index.records.contains_key(&k) {
+            continue;
+        }
+        let path = dir.join(dir_name(kind)).join(format!("{key}.json"));
+        if let Some(entry) = rebuild_entry(&path, api_url(base, kind, &key), last_pull) {
+            index.records.insert(k, entry);
+        }
+    }
+    Ok(index)
+}
 
 /// Metadata stored at the root of a local database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +371,7 @@ pub async fn pull(
     opts: &PullOptions,
     mut on_event: impl FnMut(&PullEvent),
 ) -> Result<PullSummary> {
+    check_format(dir)?;
     for kind in [
         ComponentType::Core,
         ComponentType::Plugin,
@@ -176,21 +393,33 @@ pub async fn pull(
     }
     let total = unique.len();
     let base = opts.api_url.trim_end_matches('/').to_string();
+    let mut index = load_index(dir, &base)?;
+    let work: Vec<_> = unique
+        .into_iter()
+        .map(|(kind, key)| {
+            let old = index.records.get(&index_key(kind, &key)).cloned();
+            (kind, key, old)
+        })
+        .collect();
 
-    let mut results = stream::iter(unique.into_iter().map(|(kind, key)| {
+    let mut results = stream::iter(work.into_iter().map(|(kind, key, old)| {
         let client = &client;
         let base = &base;
         async move {
-            let status = pull_one(client, base, dir, kind, &key, opts).await;
-            (kind, key, status)
+            let (status, entry) = pull_one(client, base, dir, kind, &key, old.as_ref(), opts).await;
+            (kind, key, status, entry)
         }
     }))
     .buffer_unordered(opts.jobs.max(1));
 
     let mut summary = PullSummary::default();
     let mut done = 0;
-    while let Some((kind, key, status)) = results.next().await {
+    let mut fresh_entries = Vec::new();
+    while let Some((kind, key, status, entry)) = results.next().await {
         done += 1;
+        if let Some(entry) = entry {
+            fresh_entries.push((index_key(kind, &key), entry));
+        }
         match &status {
             PullStatus::Saved(n) => {
                 summary.saved += 1;
@@ -214,6 +443,8 @@ pub async fn pull(
     }
     drop(results);
 
+    index.records.extend(fresh_entries);
+    write_index(dir, &index)?;
     write_meta(
         dir,
         &DbMeta {
@@ -225,34 +456,45 @@ pub async fn pull(
     Ok(summary)
 }
 
+/// Seconds since the record was last confirmed current: from the index
+/// when it has an entry, otherwise from the file's modification time
+fn record_age(path: &Path, old: Option<&IndexEntry>) -> Option<Duration> {
+    match old {
+        Some(e) => Some(Duration::from_secs(now().saturating_sub(e.checked_at))),
+        None => std::fs::metadata(path)
+            .ok()?
+            .modified()
+            .ok()?
+            .elapsed()
+            .ok(),
+    }
+}
+
 async fn pull_one(
     client: &Client,
     base: &str,
     dir: &Path,
     kind: ComponentType,
     key: &str,
+    old: Option<&IndexEntry>,
     opts: &PullOptions,
-) -> PullStatus {
+) -> (PullStatus, Option<IndexEntry>) {
     let Some(path) = record_path(dir, kind, key) else {
-        return PullStatus::Invalid;
+        return (PullStatus::Invalid, None);
     };
 
     if let Some(max_age) = opts.max_age
-        && let Ok(meta) = std::fs::metadata(&path)
-        && meta
-            .modified()
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age < max_age)
+        && record_age(&path, old).is_some_and(|age| age < max_age)
         && let Some(kind) = std::fs::read_to_string(&path)
             .ok()
             .as_deref()
             .and_then(record_kind)
     {
-        return match kind {
+        let status = match kind {
             RecordKind::Tracked(n) => PullStatus::Fresh(n),
             RecordKind::Untracked => PullStatus::NoData,
         };
+        return (status, None);
     }
 
     let url = api_url(base, kind, key);
@@ -271,15 +513,40 @@ async fn pull_one(
             }
         };
         let code = response.status();
+        let header = |name: reqwest::header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let etag = header(reqwest::header::ETAG);
+        let last_modified = header(reqwest::header::LAST_MODIFIED);
+        let store = |body: &str, kind: RecordKind, ok: PullStatus| {
+            let entry = entry_for(
+                body,
+                kind,
+                url.clone(),
+                Some(code.as_u16()),
+                etag.clone(),
+                last_modified.clone(),
+                now(),
+                false,
+            );
+            match save(&path, body, ok) {
+                ok @ (PullStatus::Saved(_) | PullStatus::NoData) => (ok, Some(entry)),
+                failed => (failed, None),
+            }
+        };
         if code == StatusCode::NOT_FOUND {
-            return save(&path, UNTRACKED_RECORD, PullStatus::NoData);
+            return store(UNTRACKED_RECORD, RecordKind::Untracked, PullStatus::NoData);
         }
         if code == StatusCode::TOO_MANY_REQUESTS || code.is_server_error() {
             last_error = format!("HTTP {}", code.as_u16());
             continue;
         }
         if !code.is_success() {
-            return PullStatus::Failed(format!("HTTP {}", code.as_u16()));
+            return (PullStatus::Failed(format!("HTTP {}", code.as_u16())), None);
         }
         let body = match response.text().await {
             Ok(b) => b,
@@ -289,15 +556,15 @@ async fn pull_one(
             }
         };
         return match record_kind(&body) {
-            Some(RecordKind::Tracked(n)) => save(&path, &body, PullStatus::Saved(n)),
-            Some(RecordKind::Untracked) => save(&path, &body, PullStatus::NoData),
+            Some(k @ RecordKind::Tracked(n)) => store(&body, k, PullStatus::Saved(n)),
+            Some(k @ RecordKind::Untracked) => store(&body, k, PullStatus::NoData),
             None => {
                 last_error = "unexpected response (blocked or rate limited?)".to_string();
                 continue;
             }
         };
     }
-    PullStatus::Failed(last_error)
+    (PullStatus::Failed(last_error), None)
 }
 
 /// Write via a temp file and rename, so an interrupted pull never leaves
@@ -353,14 +620,38 @@ pub struct DbStatus {
     pub records: usize,
     /// Unix time of the oldest record file
     pub oldest: Option<u64>,
+    /// Entries in `index.json`; `None` without an index (format 1)
+    pub indexed: Option<usize>,
+    /// Of those, entries rebuilt from files (download details unknown)
+    pub rebuilt: usize,
+    /// Unix time of the oldest confirmation among indexed records that
+    /// were ever confirmed
+    pub oldest_check: Option<u64>,
+    /// Indexed records never confirmed (rebuilt from files)
+    pub unconfirmed: usize,
 }
 
 /// Inspect a local database directory
 pub fn status(dir: &Path) -> Result<DbStatus> {
+    let index = read_index(dir)?;
     let mut st = DbStatus {
         meta: std::fs::read_to_string(dir.join(META_FILE))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok()),
+        indexed: index.as_ref().map(|i| i.records.len()),
+        rebuilt: index
+            .as_ref()
+            .map_or(0, |i| i.records.values().filter(|e| e.rebuilt).count()),
+        oldest_check: index.as_ref().and_then(|i| {
+            i.records
+                .values()
+                .map(|e| e.checked_at)
+                .filter(|&t| t > 0)
+                .min()
+        }),
+        unconfirmed: index.map_or(0, |i| {
+            i.records.values().filter(|e| e.checked_at == 0).count()
+        }),
         ..Default::default()
     };
     for kind in [

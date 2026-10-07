@@ -75,6 +75,10 @@ pub enum Error {
     #[error("inventory failed: {0}")]
     Inventory(String),
 
+    /// Local database is unusable (unknown format, unreadable index)
+    #[error("local database: {0}")]
+    Database(String),
+
     /// Aliases file could not be read or is invalid
     #[error("invalid aliases file: {0}")]
     Aliases(String),
