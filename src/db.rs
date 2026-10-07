@@ -22,7 +22,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::http::USER_AGENT;
+use crate::http::API_USER_AGENT;
 use crate::scanner::ComponentType;
 use crate::vulnerability::{RecordKind, api_url, record_kind};
 
@@ -163,7 +163,7 @@ pub async fn pull(
         std::fs::create_dir_all(dir.join(dir_name(kind)))?;
     }
     let client = Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(API_USER_AGENT)
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Error::HttpClient(e.to_string()))?;

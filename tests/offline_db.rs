@@ -254,3 +254,25 @@ fn opts_offline() -> PullOptions {
         max_age: None,
     }
 }
+
+#[tokio::test]
+async fn pull_identifies_itself() {
+    use wiremock::matchers::header_regex;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/plugin/akismet/"))
+        .and(header_regex(
+            "user-agent",
+            r"^wordpress-vulnerable-scanner/\d+\.\d+\.\d+ \(\+https://",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(record("")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = temp_db("ua");
+    let items = vec![(ComponentType::Plugin, "akismet".to_string())];
+    let summary = db::pull(&dir, &items, &opts(&server), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(summary.saved, 1);
+}
