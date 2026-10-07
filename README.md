@@ -309,6 +309,23 @@ in the directory (such as leftovers of an interrupted write), and, with
 `--inventory`, that every lookup the inventory needs was pulled. Each problem says
 what it means and how to fix it; the exit code is 1 when there is any.
 
+### Moving it to an offline machine
+
+```bash
+# where the internet works
+wordpress-vulnerable-scanner db export --db wpvuln-db -o wpvuln-db.tar.gz
+
+# on the offline machine
+wordpress-vulnerable-scanner db import wpvuln-db.tar.gz --db wpvuln-db
+```
+
+`db export` only packs a database that passes `db verify`, and adds a
+`MANIFEST.json` with every file's sha256. `db import` unpacks into a temporary
+directory, refuses unsafe paths, links and oversized bundles, checks every file
+against the manifest and runs `db verify`; only then does it replace the target,
+keeping the previous database as `<dir>.bak-<time>`. If anything fails, the
+existing database is left untouched.
+
 A format 1 database (no index) still works for scans and is migrated by the next
 `db pull`. Records found without an index entry are indexed from the file but
 marked unconfirmed: copying a database resets file times, so nothing says how

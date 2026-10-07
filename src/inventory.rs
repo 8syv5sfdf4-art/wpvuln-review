@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::archive::{Skip, clean_entry_path};
 use crate::error::{Error, Result};
 use crate::scanner::ComponentType;
 
@@ -523,33 +524,6 @@ struct ArchiveTree {
     dirs: HashMap<String, std::collections::BTreeMap<String, bool>>,
     /// Zip entry index for each file path
     zip_index: HashMap<String, usize>,
-}
-
-/// Why an archive entry was skipped
-enum Skip {
-    Unsafe,
-    NotUtf8,
-    Link,
-}
-
-/// A safe relative path for an archive entry: `\` counts as a separator,
-/// `.` and empty parts are dropped, and absolute paths, drive letters and
-/// `..` are refused. `Some("")` is the archive root.
-fn clean_entry_path(raw: &[u8]) -> std::result::Result<String, Skip> {
-    let s = std::str::from_utf8(raw).map_err(|_| Skip::NotUtf8)?;
-    let s = s.replace('\\', "/");
-    if s.starts_with('/') || s.as_bytes().get(1) == Some(&b':') {
-        return Err(Skip::Unsafe);
-    }
-    let mut parts = Vec::new();
-    for part in s.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => return Err(Skip::Unsafe),
-            p => parts.push(p),
-        }
-    }
-    Ok(parts.join("/"))
 }
 
 impl ArchiveTree {

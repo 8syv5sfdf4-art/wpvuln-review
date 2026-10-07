@@ -259,6 +259,40 @@ enum DbCommand {
         )]
         aliases: Option<PathBuf>,
     },
+    /// Pack a verified database into one file with checksums, for transfer
+    Export {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// Bundle to write
+        #[arg(
+            short = 'o',
+            long,
+            value_name = "FILE",
+            default_value = "wpvuln-db.tar.gz"
+        )]
+        output: PathBuf,
+    },
+    /// Replace a database with a bundle from `db export`, after checking it
+    Import {
+        /// Bundle made by `db export`
+        bundle: PathBuf,
+
+        /// Database directory to replace (the old one is kept as a backup)
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+    },
     /// Show what a local database contains
     Status {
         /// Database directory
@@ -670,6 +704,42 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             inventory,
             aliases,
         } => verify_cli(dir, inventory.as_deref(), aliases.as_deref()),
+        DbCommand::Export { db: dir, output } => {
+            let m = wordpress_vulnerable_scanner::transfer::export(dir, output)?;
+            let s = Style::stdout();
+            println!(
+                "{} {} files from {} into {}",
+                s.bold("Exported"),
+                m.files.len(),
+                dir.display(),
+                output.display()
+            );
+            println!(
+                "Copy it to the offline machine, then: {}",
+                s.bold(&format!(
+                    "wordpress-vulnerable-scanner db import {}",
+                    output
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ))
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        DbCommand::Import { bundle, db: dir } => {
+            let done = wordpress_vulnerable_scanner::transfer::import(bundle, dir)?;
+            let s = Style::stdout();
+            println!(
+                "{} {} files into {}: every file matched the manifest and `db verify` passed",
+                s.bold("Imported"),
+                done.files,
+                dir.display()
+            );
+            if let Some(b) = done.backup {
+                println!("The previous database was moved to {}", b.display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         DbCommand::Status { db: dir, json } => {
             let st = db::status(dir)?;
             if *json {

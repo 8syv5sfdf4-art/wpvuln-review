@@ -446,3 +446,124 @@ async fn verify_reports_inventory_gaps_and_unknown_formats() {
     assert!(problems(&dir)[0].contains("format 9 is newer than this tool understands"));
     assert!(problems(&temp_db("verify-none"))[0].contains("not a directory"));
 }
+
+use wordpress_vulnerable_scanner::transfer;
+
+#[tokio::test]
+async fn export_import_round_trip_keeps_a_backup() {
+    let src = pulled("export-src").await;
+    let bundle = src.with_extension("tar.gz");
+    let m = transfer::export(&src, &bundle).unwrap();
+    assert!(m.files.contains_key("index.json") && m.files.contains_key("plugin/akismet.json"));
+
+    let target = temp_db("import-target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("old-marker"), "previous").unwrap();
+    let done = transfer::import(&bundle, &target).unwrap();
+    assert_eq!(done.files, m.files.len());
+    let backup = done.backup.unwrap();
+    assert!(backup.join("old-marker").exists());
+    assert!(db::verify(&target, &[]).ok());
+    for f in m.files.keys() {
+        assert_eq!(
+            std::fs::read(src.join(f)).unwrap(),
+            std::fs::read(target.join(f)).unwrap(),
+            "{f}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(backup);
+}
+
+#[tokio::test]
+async fn export_refuses_a_damaged_database() {
+    let src = pulled("export-bad").await;
+    std::fs::write(src.join("plugin/akismet.json"), record(&["planted"])).unwrap();
+    let err = transfer::export(&src, &src.with_extension("tar.gz"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not pass `db verify`"), "{err}");
+}
+
+/// Rewrite a bundle, changing one file's content but not the manifest
+fn tamper(bundle: &Path, out: &Path, victim: &str) {
+    let mut input = tar::Archive::new(flate2::read::GzDecoder::new(
+        std::fs::File::open(bundle).unwrap(),
+    ));
+    let gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(out).unwrap(),
+        flate2::Compression::fast(),
+    );
+    let mut output = tar::Builder::new(gz);
+    for entry in input.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+        if name == victim {
+            bytes = record(&["planted"]).into_bytes();
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_size(bytes.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        output.append_data(&mut h, &name, bytes.as_slice()).unwrap();
+    }
+    output.into_inner().unwrap().finish().unwrap();
+}
+
+#[tokio::test]
+async fn import_rejects_tampered_bundles_and_keeps_the_old_database() {
+    let src = pulled("tamper-src").await;
+    let bundle = src.with_extension("tar.gz");
+    transfer::export(&src, &bundle).unwrap();
+    let bad = src.with_extension("bad.tar.gz");
+    tamper(&bundle, &bad, "plugin/akismet.json");
+
+    let target = temp_db("tamper-target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("old-marker"), "previous").unwrap();
+    let err = transfer::import(&bad, &target).unwrap_err().to_string();
+    assert!(
+        err.contains("plugin/akismet.json: does not match the manifest"),
+        "{err}"
+    );
+    assert!(target.join("old-marker").exists(), "old database untouched");
+    let leftovers: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains("tamper-target.import")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "staging directory removed");
+}
+
+#[test]
+fn import_rejects_unsafe_paths() {
+    let dir = temp_db("evil-bundle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle = dir.join("evil.tar.gz");
+    let gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(&bundle).unwrap(),
+        flate2::Compression::fast(),
+    );
+    let mut tar = tar::Builder::new(gz);
+    let mut h = tar::Header::new_old();
+    let name = b"../escape.json";
+    h.as_old_mut().name[..name.len()].copy_from_slice(name);
+    h.set_size(2);
+    h.set_mode(0o644);
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_cksum();
+    tar.append(&h, &b"{}"[..]).unwrap();
+    tar.into_inner().unwrap().finish().unwrap();
+
+    let err = transfer::import(&bundle, &dir.join("db"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unsafe path"), "{err}");
+    assert!(!dir.parent().unwrap().join("escape.json").exists());
+    assert!(!dir.join("db").exists());
+}

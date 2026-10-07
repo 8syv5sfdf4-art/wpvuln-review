@@ -34,6 +34,7 @@
 
 pub mod aliases;
 pub mod analyze;
+pub(crate) mod archive;
 pub mod changes;
 pub mod db;
 pub mod error;
@@ -41,6 +42,7 @@ pub(crate) mod http;
 pub mod inventory;
 pub mod output;
 pub mod scanner;
+pub mod transfer;
 pub mod vulnerability;
 
 // Re-export main types
