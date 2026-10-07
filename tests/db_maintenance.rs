@@ -364,3 +364,85 @@ async fn untracked_records_have_their_own_interval() {
         ]
     );
 }
+
+/// A pulled database with akismet (tracked) and premium (untracked)
+async fn pulled(name: &str) -> PathBuf {
+    let server = MockServer::start().await;
+    serve(&server, "/plugin/akismet/", 200, &record(&["a"]), None).await;
+    serve(&server, "/plugin/premium/", 200, UNTRACKED, None).await;
+    let dir = temp_db(name);
+    db::pull(
+        &dir,
+        &items(&["akismet", "premium"]),
+        &opts(&server),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    dir
+}
+
+fn problems(dir: &Path) -> Vec<String> {
+    db::verify(dir, &[]).problems
+}
+
+#[tokio::test]
+async fn verify_passes_a_clean_database() {
+    let dir = pulled("verify-clean").await;
+    let v = db::verify(&dir, &items(&["akismet"]));
+    assert!(v.ok(), "{v:#?}");
+    assert_eq!((v.records, v.untracked), (2, 1));
+}
+
+#[tokio::test]
+async fn verify_catches_tampering_and_damage() {
+    let dir = pulled("verify-tamper").await;
+    std::fs::write(dir.join("plugin/akismet.json"), record(&["a", "planted"])).unwrap();
+    let p = problems(&dir);
+    assert_eq!(p.len(), 1, "{p:#?}");
+    assert!(p[0].starts_with("plugin/akismet.json: content differs from what was downloaded"));
+
+    std::fs::write(dir.join("plugin/akismet.json"), "<html>blocked</html>").unwrap();
+    assert!(problems(&dir)[0].contains("not a valid WPVulnerability response"));
+}
+
+#[tokio::test]
+async fn verify_catches_missing_stray_and_unindexed_files() {
+    let dir = pulled("verify-files").await;
+    std::fs::remove_file(dir.join("plugin/premium.json")).unwrap();
+    std::fs::write(dir.join("plugin/akismet.json.tmp"), "x").unwrap();
+    std::fs::write(dir.join("plugin/handmade.json"), record(&[])).unwrap();
+    std::fs::write(dir.join("notes.txt"), "x").unwrap();
+    let p = problems(&dir).join("\n");
+    assert!(
+        p.contains("plugin/premium: listed in the index but its file is missing"),
+        "{p}"
+    );
+    assert!(p.contains("plugin/akismet.json.tmp: left over from an interrupted write"));
+    assert!(p.contains("plugin/handmade.json: not in the index"));
+    assert!(p.contains("notes.txt: unexpected"));
+}
+
+#[tokio::test]
+async fn verify_reports_inventory_gaps_and_unknown_formats() {
+    let dir = pulled("verify-gaps").await;
+    let v = db::verify(
+        &dir,
+        &[
+            (ComponentType::Plugin, "akismet".to_string()),
+            (ComponentType::Plugin, "never-pulled".to_string()),
+            (ComponentType::Core, "6.6.2".to_string()),
+        ],
+    );
+    assert!(v.problems.is_empty());
+    assert_eq!(v.missing, vec!["plugin/never-pulled", "core/6.6.2"]);
+    assert!(!v.ok());
+
+    std::fs::write(
+        dir.join("wpvuln-db.json"),
+        r#"{"format":9,"source":"x","pulled_at":1}"#,
+    )
+    .unwrap();
+    assert!(problems(&dir)[0].contains("format 9 is newer than this tool understands"));
+    assert!(problems(&temp_db("verify-none"))[0].contains("not a directory"));
+}

@@ -812,6 +812,198 @@ pub fn known(dir: &Path, kind: ComponentType, key: &str) -> Known {
     }
 }
 
+/// Result of [`verify`]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Verification {
+    /// Record files checked
+    pub records: usize,
+    /// Of those, untracked components (not a problem: nothing to check)
+    pub untracked: usize,
+    /// Everything wrong, each with what it means and how to fix it
+    pub problems: Vec<String>,
+    /// Lookups the inventory needs that the database lacks
+    pub missing: Vec<String>,
+}
+
+impl Verification {
+    /// Nothing wrong and nothing missing
+    pub fn ok(&self) -> bool {
+        self.problems.is_empty() && self.missing.is_empty()
+    }
+}
+
+/// Files allowed at the top of a database
+const TOP_LEVEL: [&str; 7] = [
+    META_FILE,
+    INDEX_FILE,
+    "MANIFEST.json",
+    "changes",
+    "core",
+    "plugin",
+    "theme",
+];
+
+/// Check a database: format, index, every record against its recorded
+/// sha256, stray files, and (with `needed`) coverage of an inventory
+pub fn verify(dir: &Path, needed: &[(ComponentType, String)]) -> Verification {
+    let mut v = Verification::default();
+    let mut problem = |p: String| v.problems.push(p);
+    if !dir.is_dir() {
+        problem(format!(
+            "{}: not a directory. Run `db pull` to create the database, or check the path.",
+            dir.display()
+        ));
+        return v;
+    }
+
+    match std::fs::read_to_string(dir.join(META_FILE))
+        .ok()
+        .map(|s| serde_json::from_str::<DbMeta>(&s))
+    {
+        None => problem(format!(
+            "{META_FILE}: missing, so this is not a database written by `db pull` (or it was \
+             only partly copied). Copy the whole directory, or pull again."
+        )),
+        Some(Err(e)) => problem(format!(
+            "{META_FILE}: unreadable ({e}). Pull again into a fresh directory."
+        )),
+        Some(Ok(m)) if m.format > FORMAT_VERSION => problem(format!(
+            "{META_FILE}: format {} is newer than this tool understands ({FORMAT_VERSION}), so \
+             nothing else can be checked. Use a newer wordpress-vulnerable-scanner.",
+            m.format
+        )),
+        Some(Ok(_)) => {}
+    }
+    let index = match read_index(dir) {
+        Ok(Some(i)) => Some(i),
+        Ok(None) => {
+            problem(format!(
+                "{INDEX_FILE}: missing, so no record can be checked against what was \
+                 downloaded (a format 1 database). Run `db update` to add the index."
+            ));
+            None
+        }
+        Err(e) => {
+            problem(e.to_string());
+            None
+        }
+    };
+
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !TOP_LEVEL.contains(&name.as_str()) {
+            problem(format!(
+                "{name}: unexpected; this tool never writes it. If it is not yours, it may have \
+                 been added after the pull; remove it before relying on this database."
+            ));
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for kind in [
+        ComponentType::Core,
+        ComponentType::Plugin,
+        ComponentType::Theme,
+    ] {
+        let folder = dir_name(kind);
+        for entry in std::fs::read_dir(dir.join(folder))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let shown = format!("{folder}/{name}");
+            let key = match name.strip_suffix(".json") {
+                Some(k) if is_safe_key(k) && entry.path().is_file() => k,
+                _ if name.ends_with(".tmp") => {
+                    problem(format!(
+                        "{shown}: left over from an interrupted write. It is never read; \
+                         delete it."
+                    ));
+                    continue;
+                }
+                _ => {
+                    problem(format!(
+                        "{shown}: not a record file this tool writes. Remove it before relying \
+                         on this database."
+                    ));
+                    continue;
+                }
+            };
+            v.records += 1;
+            let k = index_key(kind, key);
+            seen.insert(k.clone());
+            let body = match std::fs::read(entry.path()) {
+                Ok(b) => b,
+                Err(e) => {
+                    problem(format!(
+                        "{shown}: unreadable ({e}). Run `db update` to fetch it again."
+                    ));
+                    continue;
+                }
+            };
+            match record_kind(&String::from_utf8_lossy(&body)) {
+                None => problem(format!(
+                    "{shown}: not a valid WPVulnerability response (damaged, or written by \
+                     something else), so scans would treat it as missing. Delete it and run \
+                     `db update`."
+                )),
+                Some(RecordKind::Untracked) => v.untracked += 1,
+                Some(RecordKind::Tracked(_)) => {}
+            }
+            let Some(index) = index.as_ref() else {
+                continue;
+            };
+            match index.records.get(&k) {
+                None => problem(format!(
+                    "{shown}: not in the index, so where it came from is unknown (added by \
+                     hand, or a pull was interrupted). Run `db update` to index it."
+                )),
+                Some(e) if e.sha256 != sha256_hex(&body) => problem(format!(
+                    "{shown}: content differs from what was downloaded (sha256 mismatch), so \
+                     it was changed afterwards. Do not trust it; run `db update` to download \
+                     it again."
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    if let Some(index) = index.as_ref() {
+        for k in index.records.keys().filter(|k| !seen.contains(*k)) {
+            problem(format!(
+                "{k}: listed in the index but its file is missing, so scans treat it as never \
+                 pulled. Run `db update` to fetch it again."
+            ));
+        }
+    }
+
+    for entry in std::fs::read_dir(dir.join("changes"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let valid = name.ends_with(".json")
+            && std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|s| serde_json::from_str::<Vec<crate::changes::Change>>(&s).ok())
+                .is_some();
+        if !valid {
+            problem(format!(
+                "changes/{name}: not a change log this tool writes. Scans never read it, but \
+                 the history it holds cannot be trusted."
+            ));
+        }
+    }
+
+    for (kind, key) in needed {
+        if !record_path(dir, *kind, key).is_some_and(|p| p.is_file()) {
+            v.missing.push(index_key(*kind, key));
+        }
+    }
+    v
+}
+
 /// Components from `items` that have no record in `dir`
 pub fn missing<'a>(
     dir: &Path,

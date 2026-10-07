@@ -234,6 +234,31 @@ enum DbCommand {
         #[arg(long, default_value_t = 168, value_name = "HOURS")]
         untracked_max_age: u64,
     },
+    /// Check a database: format, index, every record's sha256, stray files,
+    /// and optionally that it covers an inventory (exit 1 on problems)
+    Verify {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// Also check that every lookup this inventory needs is present
+        #[arg(long, value_name = "PATH")]
+        inventory: Option<PathBuf>,
+
+        /// Aliases to apply to the inventory
+        #[arg(
+            long,
+            env = "WPVULN_ALIASES",
+            value_name = "FILE",
+            requires = "inventory"
+        )]
+        aliases: Option<PathBuf>,
+    },
     /// Show what a local database contains
     Status {
         /// Database directory
@@ -640,6 +665,11 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             };
             pull_cli("Updating", dir, &items, &opts).await
         }
+        DbCommand::Verify {
+            db: dir,
+            inventory,
+            aliases,
+        } => verify_cli(dir, inventory.as_deref(), aliases.as_deref()),
         DbCommand::Status { db: dir, json } => {
             let st = db::status(dir)?;
             if *json {
@@ -812,6 +842,84 @@ async fn pull_cli(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn verify_cli(
+    dir: &Path,
+    inventory: Option<&Path>,
+    aliases: Option<&Path>,
+) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    let needed: Vec<(ComponentType, String)> = match inventory {
+        Some(path) => inventory_components(path, aliases, true)?
+            .into_iter()
+            .filter_map(|c| match c.component_type {
+                ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
+                kind => Some((kind, c.slug)),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let v = db::verify(dir, &needed);
+    let s = Style::stdout();
+    println!("{} {}", s.bold("Verifying"), dir.display());
+    println!("  {} record files checked", v.records);
+    if v.untracked > 0 {
+        println!(
+            "  {} untracked {}",
+            v.untracked,
+            s.dim(
+                "(not a problem: WPVulnerability has no entry for them, so they are not checked)"
+            )
+        );
+    }
+    if let Some(path) = inventory {
+        println!(
+            "  {} lookups needed by {}, {} missing",
+            needed.len(),
+            path.display(),
+            v.missing.len()
+        );
+    }
+    if !v.problems.is_empty() {
+        println!("\n{} ({})", s.red("Problems"), v.problems.len());
+        let digits = v.problems.len().to_string().len();
+        for (i, p) in v.problems.iter().enumerate() {
+            let indent = " ".repeat(digits + 4);
+            println!(
+                "  {} {}",
+                s.dim(&format!("{:>digits$}.", i + 1)),
+                wrap(p, 96 - indent.len()).join(&format!("\n{indent}"))
+            );
+        }
+    }
+    if !v.missing.is_empty() {
+        println!(
+            "\n{} ({}): {}",
+            s.red("Missing for the inventory"),
+            v.missing.len(),
+            v.missing.join(", ")
+        );
+        println!(
+            "  They were never pulled, so a scan would report them as not checked. Fix with:\n  \
+             wordpress-vulnerable-scanner db pull --db {} --inventory {}{}",
+            dir.display(),
+            inventory
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            aliases
+                .map(|a| format!(" --aliases {}", a.display()))
+                .unwrap_or_default()
+        );
+    }
+    if v.ok() {
+        println!(
+            "\n{}",
+            s.green("OK: every record matches what was downloaded.")
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }
 
 /// The "what is new since last time" view of a pull or update

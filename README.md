@@ -297,6 +297,18 @@ WPVulnerability's sponsor-only "last updates" endpoint could make updates
 incremental, but its response format cannot be verified without a key, so it
 is not used; the free path is a polite, conditional refresh.
 
+### Checking it
+
+```bash
+wordpress-vulnerable-scanner db verify --db wpvuln-db --inventory inventory.json --aliases aliases.toml
+```
+
+`db verify` checks that every record still matches the sha256 recorded when it
+was downloaded, that the index and the files agree, that nothing unexpected sits
+in the directory (such as leftovers of an interrupted write), and, with
+`--inventory`, that every lookup the inventory needs was pulled. Each problem says
+what it means and how to fix it; the exit code is 1 when there is any.
+
 A format 1 database (no index) still works for scans and is migrated by the next
 `db pull`. Records found without an index entry are indexed from the file but
 marked unconfirmed: copying a database resets file times, so nothing says how
