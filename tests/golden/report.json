@@ -41,7 +41,20 @@
             "CWE-94"
           ],
           "known_exploited": true,
-          "description": "[en] Remote code execution."
+          "description": "[en] Remote code execution.",
+          "ranges": [
+            {
+              "from": {
+                "inclusive": "5.0"
+              },
+              "to": {
+                "exclusive": "5.3.1"
+              }
+            }
+          ],
+          "sources": [
+            "wpvulnerability"
+          ]
         },
         {
           "id": "u-low",
@@ -54,7 +67,18 @@
           "references": [],
           "uuid": "u-low",
           "affected": "<= 9.9",
-          "unfixed": true
+          "unfixed": true,
+          "ranges": [
+            {
+              "from": "unbounded",
+              "to": {
+                "inclusive": "9.9"
+              }
+            }
+          ],
+          "sources": [
+            "wpvulnerability"
+          ]
         }
       ],
       "max_severity": "critical",
@@ -87,7 +111,18 @@
           "cwes": [
             "CWE-89"
           ],
-          "description": "SQLi via widget id."
+          "description": "SQLi via widget id.",
+          "ranges": [
+            {
+              "from": "unbounded",
+              "to": {
+                "exclusive": "3.5.6"
+              }
+            }
+          ],
+          "sources": [
+            "wpvulnerability"
+          ]
         }
       ],
       "max_severity": "high",
