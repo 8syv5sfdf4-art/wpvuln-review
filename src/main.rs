@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
     aliases::Aliases,
+    changes::{Change, ChangeKind},
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
     output::{OutputConfig, OutputFormat, output_analysis},
@@ -204,6 +205,34 @@ enum DbCommand {
         /// Skip records downloaded less than this many hours ago (0 = always download)
         #[arg(long, default_value_t = 0, value_name = "HOURS")]
         max_age: u64,
+    },
+    /// Re-check stored records that are older than their interval, and
+    /// report what changed since the last check
+    Update {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// WPVulnerability API base URL
+        #[arg(long, env = "WPVULN_API", value_name = "URL", default_value = WPVULN_API)]
+        api_url: String,
+
+        /// Requests in flight at once (please keep this low; the API is free)
+        #[arg(long, short = 'j', default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=16))]
+        jobs: u64,
+
+        /// Re-check records last confirmed more than this many hours ago (0 = all)
+        #[arg(long, default_value_t = 24, value_name = "HOURS")]
+        max_age: u64,
+
+        /// The same for untracked components, which rarely change
+        #[arg(long, default_value_t = 168, value_name = "HOURS")]
+        untracked_max_age: u64,
     },
     /// Show what a local database contains
     Status {
@@ -585,7 +614,31 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 max_age: (*max_age > 0).then(|| Duration::from_secs(max_age * 3600)),
                 ..PullOptions::default()
             };
-            pull_cli(dir, &items, &opts).await
+            pull_cli("Pulling", dir, &items, &opts).await
+        }
+        DbCommand::Update {
+            db: dir,
+            api_url,
+            jobs,
+            max_age,
+            untracked_max_age,
+        } => {
+            let items = db::stored(dir)?;
+            if items.is_empty() {
+                return Err(wordpress_vulnerable_scanner::Error::Database(format!(
+                    "{} holds no records yet; run `db pull` first",
+                    dir.display()
+                )));
+            }
+            let hours = |h: u64| (h > 0).then(|| Duration::from_secs(h * 3600));
+            let opts = PullOptions {
+                api_url: api_url.clone(),
+                jobs: *jobs as usize,
+                max_age: hours(*max_age),
+                untracked_max_age: hours(*untracked_max_age),
+                ..PullOptions::default()
+            };
+            pull_cli("Updating", dir, &items, &opts).await
         }
         DbCommand::Status { db: dir, json } => {
             let st = db::status(dir)?;
@@ -651,6 +704,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
 }
 
 async fn pull_cli(
+    verb: &str,
     dir: &Path,
     items: &[(ComponentType, String)],
     opts: &PullOptions,
@@ -666,7 +720,7 @@ async fn pull_cli(
     let digits = total.to_string().len();
     println!(
         "{} {} component{} from {} into {} ({} parallel)\n",
-        s.bold("Pulling"),
+        s.bold(verb),
         total,
         if total == 1 { "" } else { "s" },
         opts.api_url,
@@ -683,6 +737,10 @@ async fn pull_cli(
                 format!("{n} record{}", if *n == 1 { "" } else { "s" }),
             ),
             PullStatus::Fresh(n) => (s.dim("="), s.dim(&format!("{n} records, up to date"))),
+            PullStatus::Unchanged(n) => (
+                s.dim("="),
+                s.dim(&format!("{n} records, unchanged (confirmed by the API)")),
+            ),
             PullStatus::NoData => (
                 s.yellow("?"),
                 s.yellow("not tracked by WPVulnerability (not checked)"),
@@ -716,6 +774,9 @@ async fn pull_cli(
     if summary.fresh > 0 {
         parts.push(format!("{} up to date", summary.fresh));
     }
+    if summary.unchanged > 0 {
+        parts.push(format!("{} unchanged", summary.unchanged));
+    }
     if summary.no_data > 0 {
         parts.push(s.yellow(&format!("{} not tracked", summary.no_data)));
     }
@@ -737,6 +798,7 @@ async fn pull_cli(
             s.yellow("Re-run the same command to retry the failed ones; saved records are kept.")
         );
     }
+    print_changes(&s, dir, &summary.changes, verb == "Updating");
     println!(
         "Scan offline with: {}",
         s.bold(&format!(
@@ -750,6 +812,58 @@ async fn pull_cli(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// The "what is new since last time" view of a pull or update
+fn print_changes(s: &Style, dir: &Path, changes: &[Change], always: bool) {
+    if changes.is_empty() {
+        if always {
+            println!("\n{}", s.bold("No changes since the last check."));
+        }
+        return;
+    }
+    println!("\n{}", s.bold("Changes since the last check"));
+    let width = changes
+        .iter()
+        .map(|c| c.key.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(48);
+    for c in changes {
+        let what = c
+            .cves
+            .first()
+            .map(|cve| format!("{cve}: "))
+            .unwrap_or_default()
+            + c.title.as_deref().or(c.uuid.as_deref()).unwrap_or_default();
+        let (mark, text) = match c.change {
+            ChangeKind::Added => (s.red("+"), format!("{what} (new vulnerability)")),
+            ChangeKind::Removed => (
+                s.green("-"),
+                format!("{what} (withdrawn or merged upstream)"),
+            ),
+            ChangeKind::Changed => (
+                s.yellow("~"),
+                format!("{what} (details changed: affected versions, score or references)"),
+            ),
+            ChangeKind::NowTracked => (
+                s.green("!"),
+                "now tracked by WPVulnerability: it is checked from now on".to_string(),
+            ),
+            ChangeKind::NoLongerTracked => (
+                s.red("!"),
+                "no longer tracked by WPVulnerability: it is not checked any more".to_string(),
+            ),
+        };
+        println!("  {mark} {:<width$}  {text}", c.key);
+    }
+    println!(
+        "{}",
+        s.dim(&format!(
+            "Logged in {}",
+            dir.join("changes").join("<date>.json").display()
+        ))
+    );
 }
 
 fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {

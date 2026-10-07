@@ -39,6 +39,7 @@ fn opts(server: &MockServer) -> PullOptions {
         attempts: 1,
         delay: Duration::ZERO,
         max_age: None,
+        untracked_max_age: None,
     }
 }
 
@@ -193,4 +194,173 @@ async fn freshness_comes_from_the_index() {
     .await
     .unwrap();
     assert_eq!(second, vec![PullStatus::Fresh(1)]);
+}
+
+fn read_changes(dir: &Path) -> Vec<serde_json::Value> {
+    let folder = dir.join("changes");
+    let mut all = Vec::new();
+    for e in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let v: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
+        all.extend(v);
+    }
+    all
+}
+
+/// Serve `first` once, then `second` for every later request
+async fn serve_twice(server: &MockServer, p: &str, first: (u16, String), second: (u16, String)) {
+    Mock::given(method("GET"))
+        .and(path(p))
+        .respond_with(ResponseTemplate::new(first.0).set_body_string(first.1))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(p))
+        .respond_with(ResponseTemplate::new(second.0).set_body_string(second.1))
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn not_modified_confirms_only_an_intact_record() {
+    use wiremock::matchers::{header, header_regex};
+    let server = MockServer::start().await;
+    let body = record(&["a"]);
+    Mock::given(method("GET"))
+        .and(path("/plugin/akismet/"))
+        .and(header("if-none-match", "W/\"v1\""))
+        // header() would split the date at its comma
+        .and(header_regex(
+            "if-modified-since",
+            "^Tue, 06 Oct 2026 23:11:50 GMT$",
+        ))
+        .respond_with(ResponseTemplate::new(304))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    serve(&server, "/plugin/akismet/", 200, &body, Some("W/\"v1\"")).await;
+    let dir = temp_db("conditional");
+    let akismet = items(&["akismet"]);
+
+    db::pull(&dir, &akismet, &opts(&server), |_| {})
+        .await
+        .unwrap();
+    let before = db::read_index(&dir).unwrap().unwrap().records["plugin/akismet"].clone();
+
+    let summary = db::pull(&dir, &akismet, &opts(&server), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        (summary.unchanged, summary.saved),
+        (1, 0),
+        "304 confirms it"
+    );
+    let after = db::read_index(&dir).unwrap().unwrap().records["plugin/akismet"].clone();
+    assert_eq!(after.sha256, before.sha256);
+    assert!(after.checked_at >= before.checked_at);
+
+    // A tampered file must not be confirmed: no conditional headers, full download
+    std::fs::write(dir.join("plugin/akismet.json"), record(&["a", "fake"])).unwrap();
+    let summary = db::pull(&dir, &akismet, &opts(&server), |_| {})
+        .await
+        .unwrap();
+    assert_eq!((summary.unchanged, summary.saved), (0, 1));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("plugin/akismet.json")).unwrap(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn changes_are_detected_and_logged() {
+    let server = MockServer::start().await;
+    let v1 = record(&["a", "b"]);
+    // "b" gets a new affected range, "a" is withdrawn, "c" is new
+    let v2 = record(&["b", "c"]).replace(
+        r#""uuid":"b","name":"Vuln b","operator":{"max_version":"9.0""#,
+        r#""uuid":"b","name":"Vuln b","operator":{"max_version":"9.1""#,
+    );
+    serve_twice(&server, "/plugin/akismet/", (200, v1), (200, v2)).await;
+    serve_twice(
+        &server,
+        "/plugin/chaty-pro/",
+        (404, String::new()),
+        (200, record(&["d"])),
+    )
+    .await;
+    let dir = temp_db("changes");
+    let both = items(&["akismet", "chaty-pro"]);
+
+    let first = db::pull(&dir, &both, &opts(&server), |_| {}).await.unwrap();
+    assert!(first.changes.is_empty(), "new records are not changes");
+
+    let second = db::pull(&dir, &both, &opts(&server), |_| {}).await.unwrap();
+    use wordpress_vulnerable_scanner::changes::ChangeKind::*;
+    let got: Vec<_> = second
+        .changes
+        .iter()
+        .map(|c| (c.key.as_str(), c.change, c.uuid.as_deref()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("plugin/akismet", Added, Some("c")),
+            ("plugin/akismet", Removed, Some("a")),
+            ("plugin/akismet", Changed, Some("b")),
+            ("plugin/chaty-pro", Added, Some("d")),
+            ("plugin/chaty-pro", NowTracked, None),
+        ]
+    );
+    let added = &second.changes[0];
+    assert_eq!(added.title.as_deref(), Some("Vuln c"));
+    assert_eq!(added.cves, vec!["CVE-2026-c".to_string()]);
+    let removed = &second.changes[1];
+    assert_eq!(
+        removed.title.as_deref(),
+        Some("Vuln a"),
+        "title from the old file"
+    );
+
+    let logged = read_changes(&dir);
+    assert_eq!(logged.len(), 5);
+    assert_eq!(logged[0]["change"], "added");
+    assert_eq!(logged[4]["change"], "now_tracked");
+}
+
+#[tokio::test]
+async fn untracked_records_have_their_own_interval() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/plugin/akismet/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(record(&["a"])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/plugin/premium/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UNTRACKED))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = temp_db("intervals");
+    let both = items(&["akismet", "premium"]);
+    db::pull(&dir, &both, &opts(&server), |_| {}).await.unwrap();
+
+    // Tracked: always re-check; untracked: only after a week
+    let update = PullOptions {
+        max_age: Some(Duration::ZERO),
+        untracked_max_age: Some(Duration::from_secs(7 * 24 * 3600)),
+        ..opts(&server)
+    };
+    db::pull(&dir, &both, &update, |_| {}).await.unwrap();
+    assert_eq!(
+        db::stored(&dir).unwrap(),
+        vec![
+            (ComponentType::Plugin, "akismet".to_string()),
+            (ComponentType::Plugin, "premium".to_string())
+        ]
+    );
 }

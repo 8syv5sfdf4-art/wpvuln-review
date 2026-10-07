@@ -225,6 +225,31 @@ fn record_files(dir: &Path) -> Vec<(ComponentType, String)> {
     out
 }
 
+/// Every record the database holds or indexes, as (kind, key): what
+/// `db update` re-checks. Index entries whose file is missing are
+/// included, so an update restores them.
+pub fn stored(dir: &Path) -> Result<Vec<(ComponentType, String)>> {
+    let mut out = record_files(dir);
+    if let Some(index) = read_index(dir)? {
+        for key in index.records.keys() {
+            let Some((kind, name)) = key.split_once('/') else {
+                continue;
+            };
+            let kind = match kind {
+                "core" => ComponentType::Core,
+                "plugin" => ComponentType::Plugin,
+                "theme" => ComponentType::Theme,
+                _ => continue,
+            };
+            let item = (kind, name.to_string());
+            if is_safe_key(name) && !out.contains(&item) {
+                out.push(item);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The index, with entries rebuilt for any record file that lacks one.
 /// This is how a format 1 database is migrated.
 fn load_index(dir: &Path, base: &str) -> Result<Index> {
@@ -295,6 +320,9 @@ pub struct PullOptions {
     pub delay: Duration,
     /// Re-download records that are newer than this; `None` = always
     pub max_age: Option<Duration>,
+    /// Like `max_age`, for records of untracked components, which rarely
+    /// change; `None` = same as `max_age`
+    pub untracked_max_age: Option<Duration>,
 }
 
 impl Default for PullOptions {
@@ -305,6 +333,7 @@ impl Default for PullOptions {
             attempts: 3,
             delay: Duration::from_millis(250),
             max_age: None,
+            untracked_max_age: None,
         }
     }
 }
@@ -316,6 +345,9 @@ pub enum PullStatus {
     Saved(usize),
     /// Already present and fresh enough (see [`PullOptions::max_age`])
     Fresh(usize),
+    /// Asked again; the API answered "not modified" (HTTP 304), so the
+    /// stored record is confirmed current
+    Unchanged(usize),
     /// WPVulnerability has no entry for it (404, an API error, or
     /// `data: null`). Common for premium and custom plugins. The response is
     /// stored so offline scans can say "not tracked" instead of "clean"
@@ -348,14 +380,19 @@ pub struct PullSummary {
     pub saved: usize,
     /// Skipped because already fresh
     pub fresh: usize,
+    /// Confirmed current by the API (HTTP 304)
+    pub unchanged: usize,
     /// No data upstream
     pub no_data: usize,
     /// Rejected keys
     pub invalid: usize,
     /// Failed after retries
     pub failed: usize,
-    /// Vulnerability records across saved and fresh components
+    /// Vulnerability records across saved, fresh and unchanged components
     pub records: usize,
+    /// What changed in records that were replaced (also appended to
+    /// `changes/<date>.json`)
+    pub changes: Vec<crate::changes::Change>,
 }
 
 /// Stored for a 404, so the file reads as "not tracked" rather than "clean"
@@ -406,8 +443,9 @@ pub async fn pull(
         let client = &client;
         let base = &base;
         async move {
-            let (status, entry) = pull_one(client, base, dir, kind, &key, old.as_ref(), opts).await;
-            (kind, key, status, entry)
+            let (status, entry, changes) =
+                pull_one(client, base, dir, kind, &key, old.as_ref(), opts).await;
+            (kind, key, status, entry, changes)
         }
     }))
     .buffer_unordered(opts.jobs.max(1));
@@ -415,11 +453,12 @@ pub async fn pull(
     let mut summary = PullSummary::default();
     let mut done = 0;
     let mut fresh_entries = Vec::new();
-    while let Some((kind, key, status, entry)) = results.next().await {
+    while let Some((kind, key, status, entry, changes)) = results.next().await {
         done += 1;
         if let Some(entry) = entry {
             fresh_entries.push((index_key(kind, &key), entry));
         }
+        summary.changes.extend(changes);
         match &status {
             PullStatus::Saved(n) => {
                 summary.saved += 1;
@@ -427,6 +466,10 @@ pub async fn pull(
             }
             PullStatus::Fresh(n) => {
                 summary.fresh += 1;
+                summary.records += n;
+            }
+            PullStatus::Unchanged(n) => {
+                summary.unchanged += 1;
                 summary.records += n;
             }
             PullStatus::NoData => summary.no_data += 1,
@@ -445,6 +488,10 @@ pub async fn pull(
 
     index.records.extend(fresh_entries);
     write_index(dir, &index)?;
+    summary
+        .changes
+        .sort_by(|a, b| (&a.key, a.change as u8).cmp(&(&b.key, b.change as u8)));
+    crate::changes::append_log(dir, &summary.changes)?;
     write_meta(
         dir,
         &DbMeta {
@@ -470,6 +517,10 @@ fn record_age(path: &Path, old: Option<&IndexEntry>) -> Option<Duration> {
     }
 }
 
+/// What pulling one record produced: its status, a new index entry when
+/// the record was saved or confirmed, and what changed in it
+type Outcome = (PullStatus, Option<IndexEntry>, Vec<crate::changes::Change>);
+
 async fn pull_one(
     client: &Client,
     base: &str,
@@ -478,12 +529,23 @@ async fn pull_one(
     key: &str,
     old: Option<&IndexEntry>,
     opts: &PullOptions,
-) -> (PullStatus, Option<IndexEntry>) {
+) -> Outcome {
     let Some(path) = record_path(dir, kind, key) else {
-        return (PullStatus::Invalid, None);
+        return (PullStatus::Invalid, None, Vec::new());
     };
 
-    if let Some(max_age) = opts.max_age
+    let max_age = match old.map(|e| e.kind) {
+        Some(EntryKind::Untracked) => opts.untracked_max_age.or(opts.max_age),
+        _ => opts.max_age,
+    };
+    // The stored file as it was before this pull, if it is still intact:
+    // only then may "not modified" confirm it
+    let old_body = std::fs::read_to_string(&path).ok();
+    let intact = old
+        .zip(old_body.as_deref())
+        .is_some_and(|(e, body)| sha256_hex(body.as_bytes()) == e.sha256);
+
+    if let Some(max_age) = max_age
         && record_age(&path, old).is_some_and(|age| age < max_age)
         && let Some(kind) = std::fs::read_to_string(&path)
             .ok()
@@ -494,10 +556,11 @@ async fn pull_one(
             RecordKind::Tracked(n) => PullStatus::Fresh(n),
             RecordKind::Untracked => PullStatus::NoData,
         };
-        return (status, None);
+        return (status, None, Vec::new());
     }
 
     let url = api_url(base, kind, key);
+    let entry_key = index_key(kind, key);
     let mut last_error = String::new();
     for attempt in 0..opts.attempts.max(1) {
         if attempt > 0 {
@@ -505,7 +568,16 @@ async fn pull_one(
         }
         tokio::time::sleep(opts.delay).await;
 
-        let response = match client.get(&url).send().await {
+        let mut request = client.get(&url);
+        if let Some(e) = old.filter(|_| intact) {
+            if let Some(ref tag) = e.etag {
+                request = request.header(reqwest::header::IF_NONE_MATCH, tag);
+            }
+            if let Some(ref date) = e.last_modified {
+                request = request.header(reqwest::header::IF_MODIFIED_SINCE, date);
+            }
+        }
+        let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 last_error = short_error(&e);
@@ -533,11 +605,30 @@ async fn pull_one(
                 now(),
                 false,
             );
+            let changes = match old {
+                Some(o) if o.sha256 != entry.sha256 => {
+                    crate::changes::diff(&entry_key, o, old_body.as_deref(), &entry, body, now())
+                }
+                _ => Vec::new(),
+            };
             match save(&path, body, ok) {
-                ok @ (PullStatus::Saved(_) | PullStatus::NoData) => (ok, Some(entry)),
-                failed => (failed, None),
+                ok @ (PullStatus::Saved(_) | PullStatus::NoData) => (ok, Some(entry), changes),
+                failed => (failed, None, Vec::new()),
             }
         };
+        if code == StatusCode::NOT_MODIFIED
+            && let Some(e) = old.filter(|_| intact)
+        {
+            let confirmed = IndexEntry {
+                checked_at: now(),
+                ..e.clone()
+            };
+            let status = match e.kind {
+                EntryKind::Tracked => PullStatus::Unchanged(e.records),
+                EntryKind::Untracked => PullStatus::NoData,
+            };
+            return (status, Some(confirmed), Vec::new());
+        }
         if code == StatusCode::NOT_FOUND {
             return store(UNTRACKED_RECORD, RecordKind::Untracked, PullStatus::NoData);
         }
@@ -546,7 +637,11 @@ async fn pull_one(
             continue;
         }
         if !code.is_success() {
-            return (PullStatus::Failed(format!("HTTP {}", code.as_u16())), None);
+            return (
+                PullStatus::Failed(format!("HTTP {}", code.as_u16())),
+                None,
+                Vec::new(),
+            );
         }
         let body = match response.text().await {
             Ok(b) => b,
@@ -564,7 +659,7 @@ async fn pull_one(
             }
         };
     }
-    (PullStatus::Failed(last_error), None)
+    (PullStatus::Failed(last_error), None, Vec::new())
 }
 
 /// Write via a temp file and rename, so an interrupted pull never leaves

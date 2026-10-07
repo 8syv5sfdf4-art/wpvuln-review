@@ -270,6 +270,33 @@ wpvuln-db/
 └── core/<version>.json
 ```
 
+### Keeping it current
+
+```bash
+wordpress-vulnerable-scanner db update --db wpvuln-db
+```
+
+`db update` re-checks every stored record last confirmed more than
+`--max-age` hours ago (default 24), and untracked components after
+`--untracked-max-age` (default 168), since those rarely change. Requests are
+conditional (`If-None-Match` / `If-Modified-Since`), so an unchanged record
+costs the API almost nothing. A "not modified" answer only confirms a record
+whose file still matches its recorded sha256; a damaged file is downloaded again.
+
+Whenever a record's content changes, during `db update` or `db pull`, the
+difference is shown and appended to `wpvuln-db/changes/<date>.json`:
+
+```text
+Changes since the last check
+  + plugin/elementor   CVE-2026-1234: Elementor < 3.36 - XSS (new vulnerability)
+  ~ plugin/woocommerce CVE-2026-3589: ... (details changed: affected versions, score or references)
+  ! plugin/chaty-pro   now tracked by WPVulnerability: it is checked from now on
+```
+
+WPVulnerability's sponsor-only "last updates" endpoint could make updates
+incremental, but its response format cannot be verified without a key, so it
+is not used; the free path is a polite, conditional refresh.
+
 A format 1 database (no index) still works for scans and is migrated by the next
 `db pull`. Records found without an index entry are indexed from the file but
 marked unconfirmed: copying a database resets file times, so nothing says how

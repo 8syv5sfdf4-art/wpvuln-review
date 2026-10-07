@@ -34,6 +34,7 @@
 
 pub mod aliases;
 pub mod analyze;
+pub mod changes;
 pub mod db;
 pub mod error;
 pub(crate) mod http;

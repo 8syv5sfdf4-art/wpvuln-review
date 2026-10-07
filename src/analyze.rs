@@ -233,8 +233,11 @@ pub(crate) fn chrono_lite_now() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let secs = duration.as_secs();
+    iso_date(duration.as_secs())
+}
 
+/// Unix time as `YYYY-MM-DDTHH:MM:SSZ`
+pub(crate) fn iso_date(secs: u64) -> String {
     // Calculate date/time components
     let days = secs / 86400;
     let time_secs = secs % 86400;

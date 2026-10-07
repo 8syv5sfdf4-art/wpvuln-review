@@ -37,6 +37,7 @@ fn opts(server: &MockServer) -> PullOptions {
         attempts: 2,
         delay: Duration::ZERO,
         max_age: None,
+        untracked_max_age: None,
     }
 }
 
@@ -252,6 +253,7 @@ fn opts_offline() -> PullOptions {
         attempts: 1,
         delay: Duration::ZERO,
         max_age: None,
+        untracked_max_age: None,
     }
 }
 
