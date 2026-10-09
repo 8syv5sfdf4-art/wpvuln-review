@@ -19,7 +19,8 @@
       "severity_justification": "CVSS 9.8 as published by the data source",
       "tags": [
         "wordpress",
-        "plugin"
+        "plugin",
+        "source-wpvulnerability"
       ],
       "title": "akismet 5.3: Akismet <= 5.3 – Unauthenticated RCE | \"quoted\", with comma",
       "unique_id_from_tool": "plugin/akismet/u-crit",
@@ -38,7 +39,8 @@
       "severity_justification": "CVSS 3.1 as published by the data source",
       "tags": [
         "wordpress",
-        "plugin"
+        "plugin",
+        "source-wpvulnerability"
       ],
       "title": "akismet 5.3: Akismet info leak",
       "unique_id_from_tool": "plugin/akismet/u-low",
@@ -63,7 +65,8 @@
       "tags": [
         "wordpress",
         "plugin",
-        "alias-match"
+        "alias-match",
+        "source-wpvulnerability"
       ],
       "title": "chaty-pro2 3.3.6: Chaty Pro < 3.5.6 - SQL Injection",
       "unique_id_from_tool": "plugin/chaty-pro2/u-high",

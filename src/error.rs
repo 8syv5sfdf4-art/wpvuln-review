@@ -71,6 +71,10 @@ pub enum Error {
     #[error("invalid severity level: {0}")]
     InvalidSeverity(String),
 
+    /// Wordfence feed could not be read or fetched
+    #[error("wordfence: {0}")]
+    Wordfence(String),
+
     /// Inventory could not be taken
     #[error("inventory failed: {0}")]
     Inventory(String),

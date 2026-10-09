@@ -192,7 +192,13 @@ fn unpack_and_check(bundle: &Path, staging: &Path) -> Result<usize> {
             .ok_or_else(|| what(&format!("{shown}: unsafe path, refusing the whole bundle")))?;
         count += 1;
         total = total.saturating_add(entry.size());
-        if count > MAX_FILES || entry.size() > MAX_FILE_BYTES || total > MAX_TOTAL_BYTES {
+        // A Wordfence feed is far larger than any single record
+        let file_cap = if rel.starts_with(&format!("{}/", crate::wordfence_db::DIR)) {
+            crate::wordfence_db::DEFAULT_MAX_BYTES
+        } else {
+            MAX_FILE_BYTES
+        };
+        if count > MAX_FILES || entry.size() > file_cap || total > MAX_TOTAL_BYTES {
             return Err(what(
                 &"larger than any database bundle should be, refusing it",
             ));
@@ -202,10 +208,7 @@ fn unpack_and_check(bundle: &Path, staging: &Path) -> Result<usize> {
             std::fs::create_dir_all(p)?;
         }
         let mut bytes = Vec::new();
-        entry
-            .by_ref()
-            .take(MAX_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
+        entry.by_ref().take(file_cap + 1).read_to_end(&mut bytes)?;
         std::fs::write(dest, bytes)?;
     }
 

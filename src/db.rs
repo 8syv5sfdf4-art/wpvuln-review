@@ -724,6 +724,8 @@ pub struct DbStatus {
     pub oldest_check: Option<u64>,
     /// Indexed records never confirmed (rebuilt from files)
     pub unconfirmed: usize,
+    /// The Wordfence feed, if one was pulled
+    pub wordfence: Option<crate::wordfence_db::Meta>,
 }
 
 /// Inspect a local database directory
@@ -747,6 +749,7 @@ pub fn status(dir: &Path) -> Result<DbStatus> {
         unconfirmed: index.map_or(0, |i| {
             i.records.values().filter(|e| e.checked_at == 0).count()
         }),
+        wordfence: crate::wordfence_db::read_meta(dir),
         ..Default::default()
     };
     for kind in [
@@ -787,6 +790,11 @@ pub fn status(dir: &Path) -> Result<DbStatus> {
         }
     }
     Ok(st)
+}
+
+/// Append changes found outside a pull (another source) to the change log
+pub fn append_changes(dir: &Path, changes: &[crate::changes::Change]) -> Result<()> {
+    crate::changes::append_log(dir, changes)
 }
 
 /// What a local database knows about one component
@@ -833,7 +841,7 @@ impl Verification {
 }
 
 /// Files allowed at the top of a database
-const TOP_LEVEL: [&str; 7] = [
+const TOP_LEVEL: [&str; 8] = [
     META_FILE,
     INDEX_FILE,
     "MANIFEST.json",
@@ -841,6 +849,7 @@ const TOP_LEVEL: [&str; 7] = [
     "core",
     "plugin",
     "theme",
+    crate::wordfence_db::DIR,
 ];
 
 /// Check a database: format, index, every record against its recorded
@@ -995,6 +1004,8 @@ pub fn verify(dir: &Path, needed: &[(ComponentType, String)]) -> Verification {
             ));
         }
     }
+
+    v.problems.extend(crate::wordfence_db::verify(dir));
 
     for (kind, key) in needed {
         if !record_path(dir, *kind, key).is_some_and(|p| p.is_file()) {

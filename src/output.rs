@@ -1,6 +1,6 @@
 //! Output formatting for vulnerability scan results
 
-use crate::analyze::{Analysis, ComponentState, ComponentVulnerabilities};
+use crate::analyze::{Analysis, ComponentState, ComponentVulnerabilities, source_name};
 use crate::error::{Error, Result};
 use crate::vulnerability::Severity;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
@@ -431,6 +431,37 @@ fn write_summary<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
         n.clean,
         s.not_checked
     )?;
+    if !s.not_checked_by.is_empty() {
+        let per: Vec<String> = s
+            .not_checked_by
+            .iter()
+            .map(|(source, n)| format!("{} had no data for {n}", source_name(*source)))
+            .collect();
+        writeln!(
+            writer,
+            "Sources: {} (a component counts as not checked only when no source had data)",
+            per.join(", ")
+        )?;
+    }
+    write_sources(analysis, writer)?;
+    Ok(())
+}
+
+/// Which sources the scan used, and the attribution their licenses require
+fn write_sources<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
+    let used: Vec<String> = analysis
+        .sources
+        .iter()
+        .map(|s| format!("{} ({})", source_name(s.source), s.detail))
+        .collect();
+    if analysis.sources.iter().any(|s| s.attribution.is_some()) {
+        writeln!(writer, "Data: {}", used.join("; "))?;
+        for s in &analysis.sources {
+            if let Some(ref a) = s.attribution {
+                writeln!(writer, "{a}")?;
+            }
+        }
+    }
     Ok(())
 }
 

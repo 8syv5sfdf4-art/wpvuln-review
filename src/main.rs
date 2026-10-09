@@ -17,6 +17,8 @@ use wordpress_vulnerable_scanner::{
         ComponentInfo, ComponentType, ScanResult, Scanner, parse_component, parse_component_list,
     },
     vulnerability::WPVULN_API,
+    wordfence::{self, Keep, WordfenceIndex},
+    wordfence_db,
 };
 
 /// WordPress vulnerability scanner - detects known CVEs in core, plugins, and themes
@@ -65,6 +67,16 @@ struct ScanArgs {
     /// Also exit 1 when any component could not be checked
     #[arg(long)]
     fail_on_unchecked: bool,
+
+    /// Wordfence feed to use: a file, or `auto` for <db>/wordfence/wordfence.json.
+    /// With --db both sources are combined; without it only Wordfence is used,
+    /// with no network access
+    #[arg(long, env = "WPVULN_WORDFENCE", value_name = "FILE|auto")]
+    wordfence: Option<String>,
+
+    /// Report Wordfence's informational records too (as low, marked)
+    #[arg(long)]
+    include_informational: bool,
 }
 
 /// Threshold for `--fail-on`
@@ -207,6 +219,90 @@ enum ListType {
     Core,
 }
 
+#[derive(Subcommand, Debug)]
+enum WordfenceCommand {
+    /// Download the Wordfence feed into <db>/wordfence/
+    Pull {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// github: wpprobe's keyless export; api: the official feed (needs a key).
+        /// Default: api when a key is set, else github
+        #[arg(long, value_enum)]
+        from: Option<FromArg>,
+
+        /// Wordfence Intelligence API key (wordfence.com > Account > Integrations)
+        #[arg(
+            long,
+            env = "WORDFENCE_API_KEY",
+            hide_env_values = true,
+            value_name = "KEY"
+        )]
+        api_key: Option<String>,
+
+        /// Intelligence feed, for --from api
+        #[arg(long, value_enum, default_value = "production")]
+        feed: FeedArg,
+
+        /// Download from this URL instead (mirrors, tests)
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+
+        /// Download from the API even if the last download was under 30 minutes ago
+        #[arg(long)]
+        force: bool,
+
+        /// Refuse feeds larger than this many MiB
+        #[arg(long, value_name = "MIB", default_value_t = wordfence_db::DEFAULT_MAX_BYTES >> 20)]
+        max_mib: u64,
+
+        /// Show what changed for the components of this inventory
+        #[arg(long, value_name = "PATH")]
+        inventory: Option<PathBuf>,
+
+        /// Aliases to apply to the inventory
+        #[arg(
+            long,
+            env = "WPVULN_ALIASES",
+            value_name = "FILE",
+            requires = "inventory"
+        )]
+        aliases: Option<PathBuf>,
+    },
+    /// Use a feed file obtained some other way (validated, then stored with its notice)
+    Import {
+        /// wpprobe or Wordfence feed JSON file
+        file: PathBuf,
+
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FromArg {
+    Github,
+    Api,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FeedArg {
+    Production,
+    Scanner,
+}
+
 // Parsed once per run, so the size difference between variants is irrelevant
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
@@ -324,6 +420,9 @@ enum DbCommand {
         )]
         db: PathBuf,
     },
+    /// Wordfence Intelligence data as a second source
+    #[command(subcommand)]
+    Wordfence(WordfenceCommand),
     /// Show what a local database contains
     Status {
         /// Database directory
@@ -417,13 +516,23 @@ async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitC
     // Build scan result from various input sources
     let (scan_result, warnings) = build_scan_result(args).await?;
 
-    let source = match args.db {
-        Some(ref dir) => Source::Local(dir.clone()),
-        None => Source::Api(args.api_url.clone()),
+    let wordfence = match args.wordfence.as_deref() {
+        None => None,
+        Some(spec) => Some(load_wordfence(spec, args.db.as_deref(), &scan_result)?),
     };
-
-    // Analyze for vulnerabilities
-    let analyzer = Analyzer::with_source(source)?;
+    let analyzer = match (args.db.as_ref(), wordfence) {
+        (Some(dir), wf) => {
+            let a = Analyzer::with_source(Source::Local(dir.clone()))?;
+            match wf {
+                Some((index, detail)) => a.with_wordfence(index, detail),
+                None => a,
+            }
+        }
+        // Wordfence alone: no network
+        (None, Some((index, detail))) => Analyzer::wordfence_only(index, detail),
+        (None, None) => Analyzer::with_source(Source::Api(args.api_url.clone()))?,
+    }
+    .include_informational(args.include_informational);
     let mut analysis = analyzer.analyze(&scan_result).await;
     analysis.warnings = warnings;
 
@@ -437,6 +546,58 @@ async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitC
         args.fail_on,
         args.fail_on_unchecked,
     )))
+}
+
+/// Load a Wordfence feed for a scan, keeping only what it can use: the
+/// scanned slugs, their name variants (for naming hints) and core
+fn load_wordfence(
+    spec: &str,
+    db: Option<&Path>,
+    scan: &ScanResult,
+) -> wordpress_vulnerable_scanner::Result<(WordfenceIndex, String)> {
+    let path = match (spec, db) {
+        ("auto", Some(dir)) => wordfence_db::feed_path(dir),
+        ("auto", None) => {
+            return Err(wordpress_vulnerable_scanner::Error::Wordfence(
+                "--wordfence auto means <db>/wordfence/wordfence.json, so it needs --db; \
+                 or give the feed file's path"
+                    .to_string(),
+            ));
+        }
+        (file, _) => PathBuf::from(file),
+    };
+    if !path.is_file() {
+        return Err(wordpress_vulnerable_scanner::Error::Wordfence(format!(
+            "{}: no feed there. Run `db wordfence pull --db <dir>` first, or give the path \
+             of a downloaded feed.",
+            path.display()
+        )));
+    }
+    let mut keep = std::collections::HashSet::new();
+    keep.insert((ComponentType::Core, "wordpress".to_string()));
+    for c in &scan.components {
+        if c.component_type == ComponentType::Core {
+            continue;
+        }
+        keep.insert((c.component_type, c.slug.to_ascii_lowercase()));
+        for (variant, _) in wordpress_vulnerable_scanner::aliases::name_variants(&c.slug) {
+            keep.insert((c.component_type, variant));
+        }
+    }
+    let index = WordfenceIndex::load(&path, &Keep::Only(keep))?;
+    let detail = match db.and_then(wordfence_db::read_meta) {
+        Some(m) if path == wordfence_db::feed_path(db.unwrap_or(Path::new(""))) => format!(
+            "{} ({}, pulled {})",
+            path.display(),
+            match m.source {
+                wordfence_db::FeedSource::Github => "GitHub wpprobe export",
+                wordfence_db::FeedSource::Api => "Intelligence API",
+            },
+            ago(m.fetched_at)
+        ),
+        _ => path.display().to_string(),
+    };
+    Ok((index, detail))
 }
 
 /// 2 for critical, 1 for other vulnerabilities, 0 otherwise. `fail_on`
@@ -766,6 +927,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             }
             Ok(ExitCode::SUCCESS)
         }
+        DbCommand::Wordfence(cmd) => wordfence_cli(cmd).await,
         DbCommand::Status { db: dir, json } => {
             let st = db::status(dir)?;
             if *json {
@@ -807,6 +969,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 );
             }
             println!("  records     {}", st.records);
+            print_wordfence_status(&s, st.wordfence.as_ref());
             match (st.indexed, st.oldest_check, st.oldest) {
                 (Some(_), Some(t), _) => println!("  oldest check {}", ago(t)),
                 (None, _, Some(t)) => println!(
@@ -1169,6 +1332,226 @@ fn print_input_warnings(s: &Style, warnings: &[String]) {
             wrap(w, 96 - indent.len()).join(&format!("\n{indent}"))
         );
     }
+}
+
+fn print_wordfence_status(s: &Style, meta: Option<&wordfence_db::Meta>) {
+    let Some(m) = meta else {
+        println!(
+            "  wordfence   {}",
+            s.dim("not pulled (`db wordfence pull` adds a second source)")
+        );
+        return;
+    };
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(m.fetched_at);
+    let source = match (m.source, m.feed) {
+        (wordfence_db::FeedSource::Api, Some(wordfence_db::Feed::Scanner)) => {
+            "Intelligence API, scanner feed"
+        }
+        (wordfence_db::FeedSource::Api, _) => "Intelligence API, production feed",
+        (wordfence_db::FeedSource::Github, _) => "GitHub (wpprobe export, CVE records only)",
+    };
+    println!("  wordfence   {source}");
+    println!(
+        "              {} records, {} slugs, {:.1} MB, pulled {}",
+        m.records,
+        m.slugs,
+        m.bytes as f64 / 1e6,
+        ago(m.fetched_at)
+    );
+    println!("              sha256 {}", &m.sha256);
+    if age > wordfence_db::STALE_AFTER.as_secs() {
+        println!(
+            "              {}",
+            s.yellow("older than 7 days: run `db wordfence pull` for current data")
+        );
+    }
+}
+
+async fn wordfence_cli(cmd: &WordfenceCommand) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    let s = Style::stdout();
+    match cmd {
+        WordfenceCommand::Import { file, db: dir } => {
+            let m = wordfence_db::import(dir, file)?;
+            println!(
+                "{} {} ({} records, {} slugs) into {}",
+                s.bold("Imported"),
+                file.display(),
+                m.records,
+                m.slugs,
+                wordfence_db::feed_path(dir).display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        WordfenceCommand::Pull {
+            db: dir,
+            from,
+            api_key,
+            feed,
+            url,
+            force,
+            max_mib,
+            inventory,
+            aliases,
+        } => {
+            let has_key = api_key.as_deref().is_some_and(|k| !k.is_empty());
+            let (source, why) = match from {
+                Some(FromArg::Github) => (wordfence_db::FeedSource::Github, "--from github"),
+                Some(FromArg::Api) => (wordfence_db::FeedSource::Api, "--from api"),
+                None if has_key => (
+                    wordfence_db::FeedSource::Api,
+                    "a key is set; pass --from github for the keyless file",
+                ),
+                None => (
+                    wordfence_db::FeedSource::Github,
+                    "no key set; WORDFENCE_API_KEY or --api-key selects the official API",
+                ),
+            };
+            let opts = wordfence_db::PullOptions {
+                from: source,
+                feed: match feed {
+                    FeedArg::Production => wordfence_db::Feed::Production,
+                    FeedArg::Scanner => wordfence_db::Feed::Scanner,
+                },
+                api_key: api_key.clone(),
+                url: url.clone(),
+                force: *force,
+                max_bytes: max_mib.saturating_mul(1 << 20),
+            };
+            println!(
+                "{} Wordfence data from {} ({why})",
+                s.bold("Pulling"),
+                match source {
+                    wordfence_db::FeedSource::Github => "GitHub",
+                    wordfence_db::FeedSource::Api => "the Intelligence API",
+                }
+            );
+
+            // With an inventory: what changed for its components
+            let keep = match inventory {
+                Some(path) => {
+                    let (components, warnings) = inventory_components(path, aliases.as_deref())?;
+                    print_input_warnings(&s, &warnings);
+                    Some(wordfence_keep(&components))
+                }
+                None => None,
+            };
+            let mut changes = Vec::new();
+            let started = Instant::now();
+            let tty = Style::stderr().0;
+            let mut shown = 0u64;
+            let progress = |bytes: u64, total: Option<u64>| {
+                // A line every 2 MB, on a terminal only
+                if tty && bytes >= shown + (2 << 20) {
+                    shown = bytes;
+                    match total {
+                        Some(t) => eprint!(
+                            "\r  {:.1} of {:.1} MB ({:.0}%)   ",
+                            bytes as f64 / 1e6,
+                            t as f64 / 1e6,
+                            bytes as f64 * 100.0 / t.max(1) as f64
+                        ),
+                        None => eprint!("\r  {:.1} MB   ", bytes as f64 / 1e6),
+                    }
+                }
+            };
+            let outcome = wordfence_db::pull(dir, &opts, progress, |new, old| {
+                let (Some(keep), Some(old)) = (keep.as_ref(), old) else {
+                    return;
+                };
+                let load = |p: &Path| WordfenceIndex::load(p, keep).ok();
+                if let (Some(a), Some(b)) = (load(old), load(new)) {
+                    changes = wordfence_diff(&a, &b);
+                }
+            })
+            .await;
+            if tty && shown > 0 {
+                eprintln!();
+            }
+            match outcome? {
+                wordfence_db::PullOutcome::TooSoon { meta, wait } => {
+                    println!(
+                        "{} The last API download was under {} minutes ago, and Wordfence \
+                         allows about one per {} minutes per key. Using the stored feed (pulled \
+                         {}). Run again in {} minutes, or pass --force.",
+                        s.yellow("Skipped."),
+                        wordfence_db::API_MIN_INTERVAL.as_secs() / 60,
+                        wordfence_db::API_MIN_INTERVAL.as_secs() / 60,
+                        ago(meta.fetched_at),
+                        wait.as_secs().div_ceil(60)
+                    );
+                }
+                wordfence_db::PullOutcome::NotModified(meta) => {
+                    println!(
+                        "{} the stored feed is current ({} records), confirmed by the server",
+                        s.bold("Not modified:"),
+                        meta.records
+                    );
+                }
+                wordfence_db::PullOutcome::Updated { meta, previous } => {
+                    println!(
+                        "{} in {:.1?}: {} records, {} slugs, {:.1} MB ({})",
+                        s.bold("Saved"),
+                        started.elapsed(),
+                        meta.records,
+                        meta.slugs,
+                        meta.bytes as f64 / 1e6,
+                        match meta.input_format {
+                            wordfence::InputFormat::Wpprobe =>
+                                "wpprobe format: records with a CVE only",
+                            wordfence::InputFormat::WordfenceRaw => "official feed format",
+                        }
+                    );
+                    println!("  {}", wordfence_db::feed_path(dir).display());
+                    if let Some(p) = previous {
+                        let delta = meta.records as i64 - p.records as i64;
+                        println!(
+                            "  previous feed: {} records, pulled {} ({delta:+} records)",
+                            p.records,
+                            ago(p.fetched_at)
+                        );
+                    }
+                    if keep.is_some() {
+                        db::append_changes(dir, &changes)?;
+                        print_changes(&s, dir, &changes, true);
+                    }
+                    println!(
+                        "{}",
+                        s.dim(&format!(
+                            "License notice saved next to it ({}/wordfence.NOTICE.txt); keep it \
+                             with every copy.",
+                            dir.join(wordfence_db::DIR).display()
+                        ))
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// The (type, slug) pairs a Wordfence load should keep for these components
+fn wordfence_keep(components: &[ComponentInfo]) -> Keep {
+    Keep::Only(
+        components
+            .iter()
+            .map(|c| (c.component_type, c.slug.to_ascii_lowercase()))
+            .collect(),
+    )
+}
+
+fn wordfence_diff(old: &WordfenceIndex, new: &WordfenceIndex) -> Vec<Change> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    wordpress_vulnerable_scanner::changes::diff_snapshots(
+        old.entries(),
+        new.entries(),
+        "wordfence",
+        now,
+    )
 }
 
 /// The "what is new since last time" view of a pull or update

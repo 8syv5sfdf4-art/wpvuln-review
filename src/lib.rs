@@ -10,6 +10,7 @@
 //! - Can pull records into a local database and scan fully offline ([`db`])
 //! - Lists installed plugins, themes and core from a directory or an archive ([`inventory`])
 //! - Maps installed folder names to wordpress.org slugs ([`aliases`])
+//! - Reads Wordfence Intelligence data as a second source ([`wordfence`])
 //! - Outputs results in human-readable or JSON format
 //!
 //! # Example
@@ -45,6 +46,8 @@ pub(crate) mod report;
 pub mod scanner;
 pub mod transfer;
 pub mod vulnerability;
+pub mod wordfence;
+pub mod wordfence_db;
 
 // Re-export main types
 pub use analyze::{Analysis, Analyzer, ComponentVulnerabilities, VulnerabilitySummary};

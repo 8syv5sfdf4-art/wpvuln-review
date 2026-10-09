@@ -1,0 +1,63 @@
+{
+  "5b9f1b1e-0000-4000-8000-000000000001": {
+    "id": "5b9f1b1e-0000-4000-8000-000000000001",
+    "title": "Chaty &lt;= 3.3.7 - Unauthenticated Stored Cross-Site Scripting",
+    "software": [
+      {"type": "plugin", "name": "Chaty", "slug": "chaty",
+       "affected_versions": {"* - 3.3.7": {"from_version": "*", "from_inclusive": true, "to_version": "3.3.7", "to_inclusive": true}},
+       "patched": true, "patched_versions": ["3.3.8"]},
+      {"type": "plugin", "name": "Chaty Pro", "slug": "chaty-pro",
+       "affected_versions": {"* - 3.3.7": {"from_version": "*", "from_inclusive": true, "to_version": "3.3.7", "to_inclusive": true}},
+       "patched": true, "patched_versions": ["3.3.8"]}
+    ],
+    "informational": false,
+    "description": "The plugin does not sanitize widget settings.",
+    "references": ["https://www.wordfence.com/threat-intel/vulnerabilities/id/5b9f1b1e"],
+    "cwe": {"id": 79, "name": "Cross-site Scripting", "description": "..."},
+    "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "score": 7.2, "rating": "High"},
+    "cve": "CVE-2026-73360",
+    "cve_link": "https://www.cve.org/CVERecord?id=CVE-2026-73360",
+    "published": "2026-05-01 12:00:00",
+    "updated": "2026-05-02 12:00:00",
+    "copyrights": {"message": "This record contains material that is subject to copyright"}
+  },
+  "5b9f1b1e-0000-4000-8000-000000000002": {
+    "id": "5b9f1b1e-0000-4000-8000-000000000002",
+    "title": "WP Rocket 3.23.1 - 3.23.3.2 - Missing Authorization",
+    "software": [
+      {"type": "plugin", "name": "WP Rocket", "slug": "wp-rocket",
+       "affected_versions": {"3.23.1 - 3.23.3.2": {"from_version": "3.23.1", "from_inclusive": true, "to_version": "3.23.3.2", "to_inclusive": true}},
+       "patched": true, "patched_versions": ["3.23.3.3"]}
+    ],
+    "informational": false,
+    "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:N", "score": 4.3, "rating": "Medium"},
+    "cve": null,
+    "cve_link": null
+  },
+  "5b9f1b1e-0000-4000-8000-000000000003": {
+    "id": "5b9f1b1e-0000-4000-8000-000000000003",
+    "title": "WooCommerce - Information about a hardening change",
+    "software": [
+      {"type": "plugin", "name": "WooCommerce", "slug": "woocommerce",
+       "affected_versions": {"*": {"from_version": "*", "from_inclusive": true, "to_version": "*", "to_inclusive": true}},
+       "patched": false, "patched_versions": []}
+    ],
+    "informational": true,
+    "cve": null
+  },
+  "5b9f1b1e-0000-4000-8000-000000000004": {
+    "id": "5b9f1b1e-0000-4000-8000-000000000004",
+    "title": "WooCommerce <= 10.4.2 - Information Exposure",
+    "software": [
+      {"type": "plugin", "name": "WooCommerce", "slug": "woocommerce",
+       "affected_versions": {
+         "10.2.0 - 10.2.2": {"from_version": "10.2.0", "from_inclusive": true, "to_version": "10.2.2", "to_inclusive": true},
+         "10.3.0 - 10.3.6": {"from_version": "10.3.0", "from_inclusive": true, "to_version": "10.3.6", "to_inclusive": true},
+         "10.4.0 - 10.4.2": {"from_version": "10.4.0", "from_inclusive": true, "to_version": "10.4.2", "to_inclusive": true}},
+       "patched": true, "patched_versions": ["10.2.3", "10.3.7", "10.4.3"]}
+    ],
+    "informational": false,
+    "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N", "score": 4.3, "rating": "Medium"},
+    "cve": "CVE-2025-15033"
+  }
+}
