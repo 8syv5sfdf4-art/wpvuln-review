@@ -331,8 +331,23 @@ A format 1 database (no index) still works for scans and is migrated by the next
 marked unconfirmed: copying a database resets file times, so nothing says how
 old they are, and the next pull or `db update` re-checks them.
 
-A scan with `--db` prints a note for components that are not tracked and a
-warning for components that were never pulled, since neither has been checked. `--db` and `--api-url`
+### What a scan says about each component
+
+Every component ends in exactly one state, in the JSON (`state`) and the report:
+
+| State | Meaning |
+|---|---|
+| `vulnerable` | tracked, and the installed version is in an affected range |
+| `alias_match` | the same, but found through an alias: confirm before acting |
+| `clean` | tracked, and no affected range contains the installed version |
+| `untracked` | the data source has no entry: **not checked** |
+| `not_in_db` | never pulled into the local database: **not checked** |
+| `unknown_version` | no version could be read: **not checked** |
+| `failed` | the lookup failed (network error, damaged record): **not checked** |
+
+The summary counts unchecked components next to the vulnerabilities, so
+"0 vulnerabilities, 12 not checked" cannot be mistaken for a clean bill of
+health. This applies to live API scans as well as `--db` scans. `--db` and `--api-url`
 (for a self-hosted mirror) can also be set with `WPVULN_DB` and `WPVULN_API`.
 
 ## Output Formats
@@ -351,6 +366,13 @@ warning for components that were never pulled, since neither has been checked. `
 | 1 | Vulnerabilities found (non-critical) |
 | 2 | Critical vulnerabilities found |
 | 10 | Error (network, parsing, etc.) |
+
+For CI, `--fail-on <none|low|medium|high|critical>` only lets findings at or
+above that severity fail the run (`none`: never), and `--fail-on-unchecked`
+exits 1 when nothing was found but some component could not be checked.
+
+`wordpress-vulnerable-scanner scan ...` is the same as the top-level form; use
+whichever reads better in scripts.
 
 ## Severity Levels
 

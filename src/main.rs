@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
-    aliases::Aliases,
+    aliases::{Aliases, MatchedVia},
     changes::{Change, ChangeKind},
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
@@ -28,6 +28,13 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
+    #[command(flatten)]
+    scan: ScanArgs,
+}
+
+/// Everything a scan takes; the same flags work with and without `scan`
+#[derive(ClapArgs, Debug)]
+struct ScanArgs {
     /// URL of the WordPress site to scan
     url: Option<String>,
 
@@ -49,6 +56,25 @@ struct Args {
     /// Minimum severity level to report
     #[arg(long = "severity", default_value = "low", value_enum)]
     min_severity: SeverityArg,
+
+    /// Exit non-zero only for vulnerabilities at or above this severity
+    /// (none: never); without it, any vulnerability exits 1 and critical 2
+    #[arg(long, value_enum, value_name = "SEVERITY")]
+    fail_on: Option<FailOn>,
+
+    /// Also exit 1 when any component could not be checked
+    #[arg(long)]
+    fail_on_unchecked: bool,
+}
+
+/// Threshold for `--fail-on`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FailOn {
+    None,
+    Low,
+    Medium,
+    High,
+    Critical,
 }
 
 /// Component inputs shared by scanning and `db pull`
@@ -92,8 +118,13 @@ struct Inputs {
     aliases: Option<PathBuf>,
 }
 
+// Parsed once per run, so the size difference between variants is irrelevant
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Check components for known vulnerabilities (the default when no
+    /// subcommand is given)
+    Scan(ScanArgs),
     /// Manage a local vulnerability database for offline scans
     #[command(subcommand)]
     Db(DbCommand),
@@ -356,15 +387,8 @@ async fn main() -> ExitCode {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
         Some(Command::Inventory(ref inv)) => run_inventory(inv),
         Some(Command::Aliases(ref cmd)) => run_aliases(cmd).await,
-        None => {
-            // Print banner for human output
-            if matches!(args.output_format, OutputFormatArg::Human) {
-                print_banner();
-            }
-            let output_config =
-                OutputConfig::new(args.output_format.into(), args.min_severity.into());
-            run_scan(&args, &output_config).await
-        }
+        Some(Command::Scan(ref scan)) => run_scan(scan).await,
+        None => run_scan(&args.scan).await,
     };
 
     match result {
@@ -376,18 +400,18 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_scan(
-    args: &Args,
-    output_config: &OutputConfig,
-) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+async fn run_scan(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    // Print banner for human output
+    if matches!(args.output_format, OutputFormatArg::Human) {
+        print_banner();
+    }
+    let output_config = &OutputConfig::new(args.output_format.into(), args.min_severity.into())
+        .with_color(Style::stdout().0);
     // Build scan result from various input sources
     let scan_result = build_scan_result(args).await?;
 
     let source = match args.db {
-        Some(ref dir) => {
-            warn_missing(dir, &scan_result.components);
-            Source::Local(dir.clone())
-        }
+        Some(ref dir) => Source::Local(dir.clone()),
         None => Source::Api(args.api_url.clone()),
     };
 
@@ -400,50 +424,56 @@ async fn run_scan(
     let mut writer = stdout.lock();
     output_analysis(&analysis, output_config, &mut writer)?;
 
-    // Return appropriate exit code
-    Ok(if analysis.summary.critical > 0 {
-        ExitCode::from(2) // Critical vulnerabilities
-    } else if analysis.summary.has_any() {
-        ExitCode::from(1) // Some vulnerabilities
+    Ok(ExitCode::from(exit_code(
+        &analysis,
+        args.fail_on,
+        args.fail_on_unchecked,
+    )))
+}
+
+/// 2 for critical, 1 for other vulnerabilities, 0 otherwise. `fail_on`
+/// ignores findings below a severity; `fail_unchecked` turns a would-be 0
+/// into 1 when anything could not be checked.
+fn exit_code(
+    analysis: &wordpress_vulnerable_scanner::Analysis,
+    fail_on: Option<FailOn>,
+    fail_unchecked: bool,
+) -> u8 {
+    let s = &analysis.summary;
+    let threshold = match fail_on {
+        None | Some(FailOn::Low) => Some(Severity::Low),
+        Some(FailOn::Medium) => Some(Severity::Medium),
+        Some(FailOn::High) => Some(Severity::High),
+        Some(FailOn::Critical) => Some(Severity::Critical),
+        Some(FailOn::None) => None,
+    };
+    let at_least = |sev: Severity| threshold.is_some_and(|t| sev >= t);
+    let count = |sev: Severity| match sev {
+        Severity::Critical => s.critical,
+        Severity::High => s.high,
+        Severity::Medium => s.medium,
+        Severity::Low => s.low,
+    };
+    let failing = [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+    ]
+    .into_iter()
+    .filter(|&sev| at_least(sev))
+    .map(count)
+    .sum::<usize>();
+    if at_least(Severity::Critical) && s.critical > 0 {
+        2
+    } else if failing > 0 || (fail_unchecked && s.not_checked > 0) {
+        1
     } else {
-        ExitCode::SUCCESS // No vulnerabilities
-    })
-}
-
-/// In offline mode, a component missing from the database would silently
-/// look clean; say so on stderr instead.
-fn warn_missing(dir: &Path, components: &[ComponentInfo]) {
-    let keys = components.iter().filter_map(|c| match c.component_type {
-        ComponentType::Core => c.version.as_deref().map(|v| (c.component_type, v)),
-        _ => Some((c.component_type, c.slug.as_str())),
-    });
-    let keys: Vec<_> = keys.collect();
-    let untracked = db::untracked(dir, keys.iter().copied());
-    if !untracked.is_empty() {
-        let s = Style::stderr();
-        eprintln!(
-            "{} {} not tracked by WPVulnerability, so not checked (common for premium/custom plugins): {}\n",
-            s.yellow("note:"),
-            untracked.len(),
-            untracked.join(", ")
-        );
-    }
-    let missing = db::missing(dir, keys.iter().copied());
-    if !missing.is_empty() {
-        let s = Style::stderr();
-        eprintln!(
-            "{} {} not in the local database (reported as clean): {}",
-            s.yellow("warning:"),
-            missing.len(),
-            missing.join(", ")
-        );
-        eprintln!(
-            "         run `wordpress-vulnerable-scanner db pull` with the same inputs to add them\n"
-        );
+        0
     }
 }
 
-async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<ScanResult> {
+async fn build_scan_result(args: &ScanArgs) -> wordpress_vulnerable_scanner::Result<ScanResult> {
     // URL scan mode
     if let Some(ref url) = args.url {
         // Add http:// if no scheme provided
@@ -457,19 +487,11 @@ async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<
         return Ok(result);
     }
 
-    Ok(ScanResult::from_components(build_components(
-        &args.inputs,
-        false,
-    )?))
+    Ok(ScanResult::from_components(build_components(&args.inputs)?))
 }
 
-/// Components named by the inputs. Inventory components without a version
-/// are kept for `db pull` (their records are still worth having) but left
-/// out of scans, which cannot match them against version ranges.
-fn build_components(
-    inputs: &Inputs,
-    keep_unversioned: bool,
-) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+/// Components named by the inputs
+fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
     let mut components = Vec::new();
 
     // Manifest file mode
@@ -484,6 +506,7 @@ fn build_components(
             component_type: ComponentType::Core,
             slug: "wordpress".to_string(),
             version: Some(core_version.clone()),
+            installed_as: None,
         });
     }
 
@@ -512,11 +535,7 @@ fn build_components(
     }
 
     if let Some(ref path) = inputs.inventory {
-        components.extend(inventory_components(
-            path,
-            inputs.aliases.as_deref(),
-            keep_unversioned,
-        )?);
+        components.extend(inventory_components(path, inputs.aliases.as_deref())?);
     }
 
     // Check we have something to scan
@@ -530,7 +549,6 @@ fn build_components(
 fn inventory_components(
     path: &Path,
     aliases: Option<&Path>,
-    keep_unversioned: bool,
 ) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
     let inv = inventory::load(path)?;
     let aliases = match aliases {
@@ -548,32 +566,19 @@ fn inventory_components(
             component_type: ComponentType::Core,
             slug: "wordpress".to_string(),
             version: Some(version),
+            installed_as: None,
         });
     }
-    let mut unversioned = Vec::new();
     for l in wordpress_vulnerable_scanner::aliases::lookups(&inv, &aliases) {
-        if l.version.is_none() && !keep_unversioned {
-            unversioned.push(l.slug);
-            continue;
-        }
         out.push(ComponentInfo {
             component_type: match l.kind {
                 Kind::Theme => ComponentType::Theme,
                 _ => ComponentType::Plugin,
             },
+            installed_as: (l.matched_via == MatchedVia::Alias).then_some(l.installed),
             slug: l.slug,
             version: l.version,
         });
-    }
-    if !unversioned.is_empty() {
-        eprintln!(
-            "{} {} not checked because no version could be read: {}. Without a version \
-             they cannot be compared with vulnerable version ranges; the inventory warnings \
-             say why each one has none.\n",
-            s.yellow("note:"),
-            unversioned.len(),
-            unversioned.join(", ")
-        );
     }
     Ok(out)
 }
@@ -612,6 +617,7 @@ fn read_manifest(
             component_type: ComponentType::Core,
             slug: "wordpress".to_string(),
             version: Some(version.to_string()),
+            installed_as: None,
         });
     }
 
@@ -629,6 +635,7 @@ fn read_manifest(
             component_type: ComponentType::Theme,
             slug: name.to_string(),
             version,
+            installed_as: None,
         });
     }
 
@@ -645,6 +652,7 @@ fn read_manifest(
                 component_type: ComponentType::Plugin,
                 slug: slug.clone(),
                 version,
+                installed_as: None,
             });
         }
     }
@@ -660,7 +668,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             jobs,
             max_age,
         } => {
-            let items: Vec<(ComponentType, String)> = build_components(inputs, true)?
+            let items: Vec<(ComponentType, String)> = build_components(inputs)?
                 .into_iter()
                 .filter_map(|c| match c.component_type {
                     ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
@@ -920,7 +928,7 @@ fn verify_cli(
     aliases: Option<&Path>,
 ) -> wordpress_vulnerable_scanner::Result<ExitCode> {
     let needed: Vec<(ComponentType, String)> = match inventory {
-        Some(path) => inventory_components(path, aliases, true)?
+        Some(path) => inventory_components(path, aliases)?
             .into_iter()
             .filter_map(|c| match c.component_type {
                 ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),

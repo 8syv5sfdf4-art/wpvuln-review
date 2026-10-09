@@ -155,6 +155,7 @@ async fn offline_analysis_reads_local_records() {
         component_type: ComponentType::Plugin,
         slug: slug.into(),
         version: Some(v.into()),
+        installed_as: None,
     };
     let scan = ScanResult::from_components(vec![
         plugin("elementor-pro", "4.2.2"), // the fixed version: clean
@@ -348,30 +349,179 @@ async fn pull_from_an_inventory_uses_aliases() {
     assert_eq!(unique, paths);
 }
 
+/// A record with one vulnerability affecting versions below `fixed`
+fn affected_below(fixed: &str) -> String {
+    record(&format!(
+        r#"{{"uuid":"u-{fixed}","name":"XSS < {fixed}","operator":{{"max_version":"{fixed}","max_operator":"lt"}},"source":[{{"id":"CVE-2026-0001"}}],"impact":{{"cvss":{{"score":"7.5"}}}}}}"#
+    ))
+}
+
 #[test]
-fn scan_from_an_inventory_skips_and_explains_unversioned() {
-    let dir = temp_db("scan-inventory");
-    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+fn every_component_ends_in_exactly_one_state() {
+    let dir = temp_db("states");
+    for sub in ["plugin", "core", "theme"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let put = |p: &str, body: &str| std::fs::write(dir.join(p), body).unwrap();
+    put("plugin/akismet.json", &affected_below("9.0")); // 5.3 -> vulnerable
+    put("plugin/chaty.json", &affected_below("4.0")); // via alias -> alias_match
+    put("plugin/hello.json", &record("")); // tracked, no vulns -> clean
+    put(
+        "plugin/bom-plugin.json",
+        r#"{"error":0,"message":null,"data":null}"#,
+    ); // untracked
+    put("plugin/edge-after.json", &affected_below("9.0")); // no version
+    put("plugin/latin1.json", "<html>blocked</html>"); // damaged -> failed
+    put("core/6.6.2.json", &record("")); // clean
+    let aliases = dir.join("aliases.toml");
+    std::fs::write(&aliases, "[plugin]\n\"chaty-pro2\" = \"chaty\"\n").unwrap();
+
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wp");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
         .args(["-o", "json", "--db"])
         .arg(&dir)
         .arg("--inventory")
         .arg(&fixture)
+        .arg("--aliases")
+        .arg(&aliases)
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not checked because no version could be read: edge-after"),
-        "{stderr}"
-    );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let slugs: Vec<&str> = json["components"]
-        .as_array()
-        .unwrap()
+    let state = |name: &str| {
+        json["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| {
+                c["installed_as"]
+                    .as_str()
+                    .unwrap_or(c["slug"].as_str().unwrap())
+                    == name
+            })
+            .unwrap_or_else(|| panic!("{name} missing"))["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(state("akismet"), "vulnerable");
+    assert_eq!(state("chaty-pro2"), "alias_match");
+    assert_eq!(state("hello"), "clean");
+    assert_eq!(state("wordpress"), "clean");
+    assert_eq!(state("bom-plugin"), "untracked");
+    assert_eq!(state("RTL-CareUnit"), "not_in_db");
+    assert_eq!(state("edge-after"), "unknown_version");
+    assert_eq!(state("latin1"), "failed");
+
+    let summary = &json["summary"];
+    assert_eq!(summary["components"]["alias_match"], 1);
+    let total = json["components"].as_array().unwrap().len() as u64;
+    let checked = ["vulnerable", "alias_match", "clean"]
         .iter()
-        .map(|c| c["slug"].as_str().unwrap())
-        .collect();
-    assert!(slugs.contains(&"chaty-pro2") && slugs.contains(&"wordpress"));
-    assert!(!slugs.contains(&"edge-after") && !slugs.contains(&"loader"));
+        .map(|k| summary["components"][k].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(checked + summary["not_checked"].as_u64().unwrap(), total);
+    // Existing fields are still there
+    assert!(summary["total"].as_u64().unwrap() >= 2 && summary.get("high").is_some());
+
+    // The human report says what was not checked, and why
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["--db"])
+        .arg(&dir)
+        .arg("--inventory")
+        .arg(&fixture)
+        .arg("--aliases")
+        .arg(&aliases)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains('\u{1b}'),
+        "no ANSI codes when piped: {text:?}"
+    );
+    assert!(text.contains("NOT CHECKED ("), "{text}");
+    assert!(text.contains("chaty-pro2 (as chaty)"));
+    assert!(
+        text.contains("not checked\n"),
+        "summary counts unchecked: {text}"
+    );
+}
+
+#[tokio::test]
+async fn live_api_mode_never_reports_unknowns_as_clean() {
+    let server = MockServer::start().await;
+    mount(&server, "/plugin/akismet/", 200, &record("")).await;
+    mount(&server, "/plugin/premium/", 404, "").await;
+    mount(&server, "/plugin/broken/", 500, "").await;
+    let scan = ScanResult::from_components(
+        ["akismet", "premium", "broken"]
+            .iter()
+            .map(|s| ComponentInfo {
+                component_type: ComponentType::Plugin,
+                slug: s.to_string(),
+                version: Some("1.0".into()),
+                installed_as: None,
+            })
+            .collect(),
+    );
+    let analysis = Analyzer::with_source(Source::Api(server.uri()))
+        .unwrap()
+        .analyze(&scan)
+        .await;
+    use wordpress_vulnerable_scanner::analyze::ComponentState::*;
+    let states: Vec<_> = analysis.components.iter().map(|c| c.state).collect();
+    assert_eq!(states, vec![Clean, Untracked, Failed]);
+    assert_eq!(analysis.summary.not_checked, 2);
+}
+
+/// Run the CLI against `db`; returns (exit code, stdout)
+fn cli(db: &std::path::Path, args: &[&str]) -> (i32, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(args)
+        .arg("--db")
+        .arg(db)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn scan_subcommand_and_exit_code_controls() {
+    let dir = temp_db("fail-on");
+    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+    // akismet 5.3: one High (7.5) finding; premium: untracked
+    std::fs::write(dir.join("plugin/akismet.json"), affected_below("9.0")).unwrap();
+    std::fs::write(
+        dir.join("plugin/premium.json"),
+        r#"{"error":0,"message":null,"data":null}"#,
+    )
+    .unwrap();
+
+    let without_date = |json: &str| {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v.as_object_mut().unwrap().remove("scan_date");
+        v
+    };
+    let (top, top_out) = cli(&dir, &["-o", "json", "-p", "akismet:5.3"]);
+    let (sub, sub_out) = cli(&dir, &["scan", "-o", "json", "-p", "akismet:5.3"]);
+    assert_eq!((top, sub), (1, 1));
+    assert_eq!(without_date(&top_out), without_date(&sub_out));
+
+    let code = |args: &[&str]| cli(&dir, &[&["scan", "-o", "none"], args].concat()).0;
+    assert_eq!(code(&["-p", "akismet:5.3", "--fail-on", "high"]), 1);
+    assert_eq!(code(&["-p", "akismet:5.3", "--fail-on", "critical"]), 0);
+    assert_eq!(code(&["-p", "akismet:5.3", "--fail-on", "none"]), 0);
+    assert_eq!(
+        code(&["-p", "premium:1.0"]),
+        0,
+        "unchecked alone does not fail"
+    );
+    assert_eq!(code(&["-p", "premium:1.0", "--fail-on-unchecked"]), 1);
+    assert_eq!(
+        code(&["-p", "akismet", "--fail-on-unchecked"]),
+        1,
+        "no version"
+    );
 }

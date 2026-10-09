@@ -1,9 +1,91 @@
 //! Analysis logic for vulnerability scanning
 
+use crate::aliases::MatchedVia;
 use crate::scanner::{ComponentInfo, ComponentType, ScanResult};
-use crate::vulnerability::{Severity, Vulnerability, VulnerabilityClient};
+use crate::vulnerability::{RecordLookup, Severity, Vulnerability, VulnerabilityClient};
 use futures::future::join_all;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// What the scan could say about one component. Exactly one applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentState {
+    /// Tracked, and the installed version is inside an affected range
+    Vulnerable,
+    /// Like `Vulnerable`, but found through an alias: premium editions may
+    /// number versions differently, so confirm before acting
+    AliasMatch,
+    /// Tracked, and no affected range contains the installed version
+    Clean,
+    /// The data source has no entry for it: not checked
+    Untracked,
+    /// The local database never pulled it: not checked
+    NotInDb,
+    /// No installed version is known, so ranges cannot be compared: not
+    /// checked
+    UnknownVersion,
+    /// The lookup failed (network error, damaged record): not checked
+    Failed,
+}
+
+impl ComponentState {
+    /// Whether the component was actually compared with vulnerability data
+    pub fn checked(self) -> bool {
+        matches!(self, Self::Vulnerable | Self::AliasMatch | Self::Clean)
+    }
+
+    /// Short human label
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vulnerable => "vulnerable",
+            Self::AliasMatch => "vulnerable (via alias, confirm)",
+            Self::Clean => "clean",
+            Self::Untracked => "not tracked",
+            Self::NotInDb => "not in the local database",
+            Self::UnknownVersion => "version unknown",
+            Self::Failed => "lookup failed",
+        }
+    }
+}
+
+/// How many components ended in each state
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StateCounts {
+    /// See [`ComponentState::Vulnerable`]
+    pub vulnerable: usize,
+    /// See [`ComponentState::AliasMatch`]
+    pub alias_match: usize,
+    /// See [`ComponentState::Clean`]
+    pub clean: usize,
+    /// See [`ComponentState::Untracked`]
+    pub untracked: usize,
+    /// See [`ComponentState::NotInDb`]
+    pub not_in_db: usize,
+    /// See [`ComponentState::UnknownVersion`]
+    pub unknown_version: usize,
+    /// See [`ComponentState::Failed`]
+    pub failed: usize,
+}
+
+impl StateCounts {
+    fn add(&mut self, state: ComponentState) {
+        use ComponentState::*;
+        *match state {
+            Vulnerable => &mut self.vulnerable,
+            AliasMatch => &mut self.alias_match,
+            Clean => &mut self.clean,
+            Untracked => &mut self.untracked,
+            NotInDb => &mut self.not_in_db,
+            UnknownVersion => &mut self.unknown_version,
+            Failed => &mut self.failed,
+        } += 1;
+    }
+
+    /// Components that were not compared with any data
+    pub fn not_checked(&self) -> usize {
+        self.untracked + self.not_in_db + self.unknown_version + self.failed
+    }
+}
 
 /// Vulnerability analysis for a single component
 #[derive(Debug, Clone, Serialize)]
@@ -18,6 +100,16 @@ pub struct ComponentVulnerabilities {
     pub vulnerabilities: Vec<Vulnerability>,
     /// Highest severity
     pub max_severity: Option<Severity>,
+    /// What the scan could say about it
+    pub state: ComponentState,
+    /// Looked up under its own slug or through an alias
+    pub matched_via: MatchedVia,
+    /// Installed slug, when looked up through an alias
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_as: Option<String>,
+    /// Why it was not checked, or what to keep in mind about the result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl ComponentVulnerabilities {
@@ -45,6 +137,10 @@ pub struct VulnerabilitySummary {
     pub low: usize,
     /// Total count
     pub total: usize,
+    /// Components that could not be compared with any data
+    pub not_checked: usize,
+    /// Components per state
+    pub components: StateCounts,
 }
 
 impl VulnerabilitySummary {
@@ -175,7 +271,11 @@ impl Analyzer {
             .flat_map(|c| c.vulnerabilities.iter())
             .collect();
 
-        let summary = VulnerabilitySummary::from_refs(&all_vulns);
+        let mut summary = VulnerabilitySummary::from_refs(&all_vulns);
+        for c in &components {
+            summary.components.add(c.state);
+        }
+        summary.not_checked = summary.components.not_checked();
 
         Analysis {
             url: if scan.url.is_empty() {
@@ -191,30 +291,79 @@ impl Analyzer {
 
     /// Analyze a single component
     async fn analyze_component(&self, component: &ComponentInfo) -> ComponentVulnerabilities {
-        let report = match component.component_type {
-            ComponentType::Core => {
-                if let Some(ref version) = component.version {
-                    self.client.fetch_core_vulns(version).await
-                } else {
-                    None
-                }
-            }
-            ComponentType::Plugin => self.client.fetch_plugin_vulns(&component.slug).await,
-            ComponentType::Theme => self.client.fetch_theme_vulns(&component.slug).await,
+        let via = if component.installed_as.is_some() {
+            MatchedVia::Alias
+        } else {
+            MatchedVia::Slug
+        };
+        let key = match component.component_type {
+            ComponentType::Core => component.version.as_deref(),
+            _ => Some(component.slug.as_str()),
+        };
+        let looked = match key {
+            Some(key) => self.client.lookup(component.component_type, key).await,
+            // Core is looked up by version, so there is nothing to ask
+            None => RecordLookup::Found(Default::default()),
         };
 
-        let filtered = report
-            .unwrap_or_default()
-            .filter_by_version(component.version.as_deref());
+        let (state, vulnerabilities, note) = match (looked, component.version.as_deref()) {
+            (RecordLookup::Failed(why), _) => (ComponentState::Failed, Vec::new(), Some(why)),
+            (RecordLookup::Missing, _) => (
+                ComponentState::NotInDb,
+                Vec::new(),
+                Some(
+                    "never pulled into the local database; run `db pull` with the same inputs"
+                        .into(),
+                ),
+            ),
+            (RecordLookup::Untracked, _) => (
+                ComponentState::Untracked,
+                Vec::new(),
+                Some(
+                    "the data source has no entry for it (common for premium and custom code)"
+                        .into(),
+                ),
+            ),
+            (RecordLookup::Found(report), None) => {
+                let note = match report.vulnerabilities.len() {
+                    0 => "no version could be read".to_string(),
+                    n => format!(
+                        "no version could be read; {n} known vulnerabilit{} affect some versions",
+                        if n == 1 { "y" } else { "ies" }
+                    ),
+                };
+                (ComponentState::UnknownVersion, Vec::new(), Some(note))
+            }
+            (RecordLookup::Found(report), Some(version)) => {
+                let found = report.filter_by_version(Some(version)).vulnerabilities;
+                let state = match (found.is_empty(), via) {
+                    (true, _) => ComponentState::Clean,
+                    (false, MatchedVia::Alias) => ComponentState::AliasMatch,
+                    (false, MatchedVia::Slug) => ComponentState::Vulnerable,
+                };
+                let note = (via == MatchedVia::Alias).then(|| {
+                    format!(
+                        "installed as {}, looked up as {}; premium editions may number versions \
+                         differently",
+                        component.installed_as.as_deref().unwrap_or_default(),
+                        component.slug
+                    )
+                });
+                (state, found, note)
+            }
+        };
 
-        let max_severity = filtered.max_severity();
-
+        let max_severity = vulnerabilities.iter().map(|v| v.severity).max();
         ComponentVulnerabilities {
             component_type: component.component_type,
             slug: component.slug.clone(),
             version: component.version.clone(),
-            vulnerabilities: filtered.vulnerabilities,
+            vulnerabilities,
             max_severity,
+            state,
+            matched_via: via,
+            installed_as: component.installed_as.clone(),
+            note,
         }
     }
 }
