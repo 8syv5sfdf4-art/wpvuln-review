@@ -6,7 +6,8 @@
 //!
 //! - Scans WordPress sites to detect core version, plugins, and themes
 //! - Queries WPVulnerability API for known CVEs
-//! - Supports multiple input modes: URL, direct component list, or JSON manifest
+//! - Supports multiple input modes: URL, direct component list, list file, or JSON manifest
+//! - Can pull records into a local database and scan fully offline ([`db`])
 //! - Outputs results in human-readable or JSON format
 //!
 //! # Example
@@ -30,6 +31,7 @@
 #![warn(missing_docs)]
 
 pub mod analyze;
+pub mod db;
 pub mod error;
 pub(crate) mod http;
 pub mod output;
@@ -41,4 +43,6 @@ pub use analyze::{Analysis, Analyzer, ComponentVulnerabilities, VulnerabilitySum
 pub use error::{Error, Result};
 pub use output::{OutputConfig, OutputFormat, output_analysis};
 pub use scanner::{ComponentInfo, ComponentType, ScanResult, Scanner};
-pub use vulnerability::{Severity, Vulnerability, VulnerabilityClient, VulnerabilityReport};
+pub use vulnerability::{
+    Severity, Source, Vulnerability, VulnerabilityClient, VulnerabilityReport,
+};

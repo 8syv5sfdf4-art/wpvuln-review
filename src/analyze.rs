@@ -147,8 +147,14 @@ pub struct Analyzer {
 impl Analyzer {
     /// Create a new analyzer
     pub fn new() -> crate::error::Result<Self> {
+        Self::with_source(crate::vulnerability::Source::default())
+    }
+
+    /// Create an analyzer that reads from a specific source
+    /// (a mirror of the API, or a local database directory)
+    pub fn with_source(source: crate::vulnerability::Source) -> crate::error::Result<Self> {
         Ok(Self {
-            client: VulnerabilityClient::new()?,
+            client: VulnerabilityClient::with_source(source)?,
         })
     }
 

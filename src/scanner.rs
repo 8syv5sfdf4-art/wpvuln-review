@@ -372,9 +372,53 @@ pub fn parse_component(s: &str, component_type: ComponentType) -> Result<Compone
     }
 }
 
+/// Parse a component list, one per line.
+///
+/// Accepts `slug:version`, `slug version`, `slug,version` or a bare `slug`.
+/// Blank lines, `#` comments and a `name,version` header (as printed by
+/// `wp plugin list --fields=name,version --format=csv`) are skipped.
+pub fn parse_component_list(
+    text: &str,
+    component_type: ComponentType,
+) -> Result<Vec<ComponentInfo>> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("name,version") {
+            continue;
+        }
+        let normalized = line
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(":");
+        out.push(parse_component(&normalized, component_type)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_list_formats() {
+        let text = "# installed\nname,version\nakismet:5.3\nwoocommerce 9.1.0\nelementor,3.20.1\n\nhello-dolly\n";
+        let list = parse_component_list(text, ComponentType::Plugin).unwrap();
+        let got: Vec<_> = list
+            .iter()
+            .map(|c| (c.slug.as_str(), c.version.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("akismet", Some("5.3")),
+                ("woocommerce", Some("9.1.0")),
+                ("elementor", Some("3.20.1")),
+                ("hello-dolly", None),
+            ]
+        );
+    }
 
     #[test]
     fn parse_valid_url() {

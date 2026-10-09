@@ -106,7 +106,61 @@ wordpress-vulnerable-scanner example.com -o json | jq '.summary'
 | Core version | `-c, --core` | Check specific WordPress version |
 | Plugins | `-p, --plugins` | Check plugins (slug:version,...) |
 | Themes | `-t, --themes` | Check themes (slug:version,...) |
+| Plugin list file | `--plugins-file` | One `slug:version` per line |
+| Theme list file | `--themes-file` | One `slug:version` per line |
 | Manifest | `-m, --manifest` | JSON file from wordpress-audit |
+
+List files accept `slug:version`, `slug version` or `slug,version`, skip blank
+lines and `#` comments, and read the CSV printed by WP-CLI directly:
+
+```bash
+wp plugin list --fields=name,version --format=csv > plugins.csv
+wordpress-vulnerable-scanner --plugins-file plugins.csv
+```
+
+## Offline scans (local database)
+
+For air-gapped servers, CI without outbound access, or simply to avoid
+re-querying the API, pull the records for your components once and scan
+from disk:
+
+```bash
+# 1. where the internet works: download records into ./wpvuln-db
+wordpress-vulnerable-scanner db pull --plugins-file plugins.csv
+
+# 2. anywhere, offline (copy the wpvuln-db directory along)
+wordpress-vulnerable-scanner --db wpvuln-db --plugins-file plugins.csv
+
+# what's in the database
+wordpress-vulnerable-scanner db status
+```
+
+`db pull` takes the same inputs as a scan (`-p`, `-t`, `-c`, `-m`, list files)
+and:
+
+- runs a few requests in parallel (`-j`, default 4) with a short pause between
+  them, since WPVulnerability is a free service
+- retries timeouts, HTTP 429 and 5xx, and keeps going when one component fails;
+  re-run the same command to retry only what's missing
+- skips records newer than `--max-age <hours>`
+- tells three cases apart: tracked with vulnerabilities, tracked with none, and
+  **not tracked** (WPVulnerability has no entry, common for premium and custom
+  plugins). Not-tracked components are stored too, and offline scans list them
+  as "not checked" rather than letting them look clean
+
+Each record is the raw API response, one file per component:
+
+```text
+wpvuln-db/
+├── wpvuln-db.json          # format, source URL, last pull
+├── plugin/<slug>.json
+├── theme/<slug>.json
+└── core/<version>.json
+```
+
+A scan with `--db` prints a note for components that are not tracked and a
+warning for components that were never pulled, since neither has been checked. `--db` and `--api-url`
+(for a self-hosted mirror) can also be set with `WPVULN_DB` and `WPVULN_API`.
 
 ## Output Formats
 
