@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
     db::{self, PullEvent, PullOptions, PullStatus},
+    inventory::{self, Kind},
     output::{OutputConfig, OutputFormat, output_analysis},
     scanner::{
         ComponentInfo, ComponentType, ScanResult, Scanner, parse_component, parse_component_list,
@@ -81,6 +82,51 @@ enum Command {
     /// Manage a local vulnerability database for offline scans
     #[command(subcommand)]
     Db(DbCommand),
+    /// List installed core, plugins and themes from files (no network, no PHP)
+    Inventory(InventoryArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct InventoryArgs {
+    /// WordPress root, wp-content or plugins directory, or a .tar, .tar.gz or .zip of one
+    path: PathBuf,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// json: full inventory; list: slug:version lines for --plugins-file / --themes-file
+    #[arg(long, default_value = "json", value_enum)]
+    format: InventoryFormat,
+
+    /// Which components a list contains
+    #[arg(long = "type", default_value = "plugin", value_enum)]
+    list_type: ListType,
+
+    /// Also ask WP-CLI (`wp` on PATH) for active/inactive status and available updates
+    #[arg(long)]
+    with_wp_cli: bool,
+
+    /// WordPress root for WP-CLI (default: PATH, when it is a WordPress root)
+    #[arg(long, value_name = "DIR", requires = "with_wp_cli")]
+    wp_path: Option<PathBuf>,
+
+    /// Pass --allow-root to WP-CLI
+    #[arg(long, requires = "with_wp_cli")]
+    allow_root: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InventoryFormat {
+    Json,
+    List,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ListType {
+    Plugin,
+    Theme,
+    Core,
 }
 
 #[derive(Subcommand, Debug)]
@@ -172,6 +218,7 @@ async fn main() -> ExitCode {
 
     let result = match args.command {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
+        Some(Command::Inventory(ref inv)) => run_inventory(inv),
         None => {
             // Print banner for human output
             if matches!(args.output_format, OutputFormatArg::Human) {
@@ -557,6 +604,110 @@ async fn pull_cli(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    let mut inv = inventory::read(&args.path)?;
+    if args.with_wp_cli {
+        if inv.source.kind == inventory::SourceKind::Archive {
+            return Err(wordpress_vulnerable_scanner::Error::Inventory(
+                "--with-wp-cli needs a live WordPress directory, not an archive".to_string(),
+            ));
+        }
+        let path = args.wp_path.clone().or_else(|| {
+            (inv.source.layout == inventory::Layout::Wordpress).then(|| args.path.clone())
+        });
+        let wp = inventory::WpCli {
+            path,
+            allow_root: args.allow_root,
+            ..Default::default()
+        };
+        inventory::enrich_with_wp_cli(&mut inv, &wp);
+    }
+    let text = match args.format {
+        InventoryFormat::Json => serde_json::to_string_pretty(&inv)? + "\n",
+        InventoryFormat::List => inv.to_list(match args.list_type {
+            ListType::Plugin => ComponentType::Plugin,
+            ListType::Theme => ComponentType::Theme,
+            ListType::Core => ComponentType::Core,
+        }),
+    };
+    match args.output {
+        Some(ref path) => std::fs::write(path, text)?,
+        None => {
+            use std::io::Write;
+            std::io::stdout().lock().write_all(text.as_bytes())?;
+        }
+    }
+
+    // Everything else goes to stderr, so stdout stays a clean file
+    let s = Style::stderr();
+    let plural = |n: usize, noun: &str| format!("{n} {noun}{}", if n == 1 { "" } else { "s" });
+    let count = |kind: Kind| inv.components.iter().filter(|c| c.kind == kind).count();
+    let mut parts = vec![
+        plural(count(Kind::Plugin), "plugin"),
+        plural(count(Kind::Theme), "theme"),
+    ];
+    for (kind, noun) in [
+        (Kind::MuPlugin, "must-use plugin"),
+        (Kind::Dropin, "drop-in"),
+        (Kind::Unloaded, "unloaded plugin"),
+    ] {
+        if count(kind) > 0 {
+            parts.push(plural(count(kind), noun));
+        }
+    }
+    if let Some(ref core) = inv.core {
+        parts.push(format!(
+            "core {}",
+            core.version.as_deref().unwrap_or("unknown")
+        ));
+    }
+    eprintln!(
+        "{} {} ({} layout): {}{}",
+        s.bold("Inventory"),
+        inv.source.path,
+        serde_json::to_value(inv.source.layout)?
+            .as_str()
+            .unwrap_or_default(),
+        parts.join(", "),
+        match inv.warnings.len() {
+            0 => String::new(),
+            n => format!(", {}", s.yellow(&plural(n, "warning"))),
+        }
+    );
+    if !inv.warnings.is_empty() {
+        eprintln!("\n{}", s.yellow("Warnings"));
+        let digits = inv.warnings.len().to_string().len();
+        for (i, w) in inv.warnings.iter().enumerate() {
+            let number = format!("{:>digits$}.", i + 1);
+            let indent = " ".repeat(digits + 4);
+            let lines = wrap(w, 96 - indent.len());
+            eprintln!(
+                "  {} {}",
+                s.dim(&number),
+                lines.join(&format!("\n{indent}"))
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Greedy word wrap for terminal messages
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("never empty");
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
 }
 
 fn ago(unix: u64) -> String {

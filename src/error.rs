@@ -68,4 +68,8 @@ pub enum Error {
     /// Invalid severity level
     #[error("invalid severity level: {0}")]
     InvalidSeverity(String),
+
+    /// Inventory could not be taken
+    #[error("inventory failed: {0}")]
+    Inventory(String),
 }

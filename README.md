@@ -118,6 +118,49 @@ wp plugin list --fields=name,version --format=csv > plugins.csv
 wordpress-vulnerable-scanner --plugins-file plugins.csv
 ```
 
+## Inventory: list what is installed
+
+`inventory` reads versions straight from the files, the way WordPress itself
+does (plugin headers in the first 8 KiB of each file, theme `style.css`,
+`wp-includes/version.php`), so it matches wp-admin. It never runs PHP and never
+touches the network, so it works on locked-down servers:
+
+```bash
+# a WordPress root, wp-content, or a plugins directory
+wordpress-vulnerable-scanner inventory /var/www/html -o inventory.json
+
+# or an archive, read in place without extracting (.tar, .tar.gz/.tgz, .zip)
+tar czf plugins.tar.gz -C /var/www/html/wp-content plugins
+wordpress-vulnerable-scanner inventory plugins.tar.gz --format list > plugins.txt
+wordpress-vulnerable-scanner --plugins-file plugins.txt
+```
+
+`--format json` (the default) records plugins, must-use plugins, drop-ins,
+themes (with their parent theme), core, and header details such as the text
+domain and plugin URI. `--format list` prints `slug:version` lines for
+`--plugins-file`; add `--type theme` or `--type core` for the other lists.
+
+When a plugin has no `Version` header, the `Stable tag` from its `readme.txt` is
+used instead, marked `"version_source": "readme"` and with a warning to confirm
+it. Header versions are `"header"`.
+
+Plugin copies sitting one folder too deep (say `plugins/Old Plugins/elementor/`)
+are not loaded by WordPress, but their files are still on disk and may be
+reachable over the web. They are listed as type `unloaded` and included in the
+plugin list (after a `#` comment), so they get scanned too.
+
+Files alone cannot tell whether a plugin is active. Where WP-CLI is installed,
+`--with-wp-cli` (plus `--wp-path DIR` and `--allow-root` if needed) adds each
+component's `status` and `update_version` from `wp plugin list` and
+`wp theme list`. Versions still come from the files; if WP-CLI fails, the
+inventory is kept as is and the failure is reported.
+
+Anything the inventory could not resolve is listed as a warning on stderr (and in the
+JSON) instead of being skipped silently: folders without a plugin header,
+missing versions, folders with several plugin headers, symlinks leaving the
+tree, and unsafe archive paths. Each warning says what it means for the scan
+and what to do about it.
+
 ## Offline scans (local database)
 
 For air-gapped servers, CI without outbound access, or simply to avoid
