@@ -264,6 +264,22 @@ fn convert(
     Ok(out)
 }
 
+/// Everything to look up for an inventory: each plugin, unloaded plugin
+/// and theme, resolved through `aliases`. Must-use plugins and drop-ins
+/// are never looked up. Identical lookups (say, a plugin covered by a
+/// theme that is checked anyway) appear once.
+pub fn lookups(inv: &Inventory, aliases: &Aliases) -> Vec<Lookup> {
+    let mut out: Vec<Lookup> = Vec::new();
+    for c in &inv.components {
+        if let Some(l) = aliases.resolve(inv, c)
+            && !out.contains(&l)
+        {
+            out.push(l);
+        }
+    }
+    out
+}
+
 /// One possible lookup slug for an installed component
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {

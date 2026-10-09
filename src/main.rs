@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
     aliases::Aliases,
+    changes::{Change, ChangeKind},
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
     output::{OutputConfig, OutputFormat, output_analysis},
@@ -76,6 +77,19 @@ struct Inputs {
     /// JSON manifest file (output from wordpress-audit)
     #[arg(long, short = 'm')]
     manifest: Option<PathBuf>,
+
+    /// Inventory to check: inventory.json, or a directory or archive to inventory
+    #[arg(long, value_name = "PATH")]
+    inventory: Option<PathBuf>,
+
+    /// Aliases file mapping inventory folder names to wordpress.org slugs
+    #[arg(
+        long,
+        env = "WPVULN_ALIASES",
+        value_name = "FILE",
+        requires = "inventory"
+    )]
+    aliases: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -162,6 +176,8 @@ enum ListType {
     Core,
 }
 
+// Parsed once per run, so the size difference between variants is irrelevant
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum DbCommand {
     /// Download records for the given components into a local database
@@ -189,6 +205,93 @@ enum DbCommand {
         /// Skip records downloaded less than this many hours ago (0 = always download)
         #[arg(long, default_value_t = 0, value_name = "HOURS")]
         max_age: u64,
+    },
+    /// Re-check stored records that are older than their interval, and
+    /// report what changed since the last check
+    Update {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// WPVulnerability API base URL
+        #[arg(long, env = "WPVULN_API", value_name = "URL", default_value = WPVULN_API)]
+        api_url: String,
+
+        /// Requests in flight at once (please keep this low; the API is free)
+        #[arg(long, short = 'j', default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=16))]
+        jobs: u64,
+
+        /// Re-check records last confirmed more than this many hours ago (0 = all)
+        #[arg(long, default_value_t = 24, value_name = "HOURS")]
+        max_age: u64,
+
+        /// The same for untracked components, which rarely change
+        #[arg(long, default_value_t = 168, value_name = "HOURS")]
+        untracked_max_age: u64,
+    },
+    /// Check a database: format, index, every record's sha256, stray files,
+    /// and optionally that it covers an inventory (exit 1 on problems)
+    Verify {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// Also check that every lookup this inventory needs is present
+        #[arg(long, value_name = "PATH")]
+        inventory: Option<PathBuf>,
+
+        /// Aliases to apply to the inventory
+        #[arg(
+            long,
+            env = "WPVULN_ALIASES",
+            value_name = "FILE",
+            requires = "inventory"
+        )]
+        aliases: Option<PathBuf>,
+    },
+    /// Pack a verified database into one file with checksums, for transfer
+    Export {
+        /// Database directory
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
+
+        /// Bundle to write
+        #[arg(
+            short = 'o',
+            long,
+            value_name = "FILE",
+            default_value = "wpvuln-db.tar.gz"
+        )]
+        output: PathBuf,
+    },
+    /// Replace a database with a bundle from `db export`, after checking it
+    Import {
+        /// Bundle made by `db export`
+        bundle: PathBuf,
+
+        /// Database directory to replace (the old one is kept as a backup)
+        #[arg(
+            long,
+            env = "WPVULN_DB",
+            value_name = "DIR",
+            default_value = "wpvuln-db"
+        )]
+        db: PathBuf,
     },
     /// Show what a local database contains
     Status {
@@ -354,10 +457,19 @@ async fn build_scan_result(args: &Args) -> wordpress_vulnerable_scanner::Result<
         return Ok(result);
     }
 
-    Ok(ScanResult::from_components(build_components(&args.inputs)?))
+    Ok(ScanResult::from_components(build_components(
+        &args.inputs,
+        false,
+    )?))
 }
 
-fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+/// Components named by the inputs. Inventory components without a version
+/// are kept for `db pull` (their records are still worth having) but left
+/// out of scans, which cannot match them against version ranges.
+fn build_components(
+    inputs: &Inputs,
+    keep_unversioned: bool,
+) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
     let mut components = Vec::new();
 
     // Manifest file mode
@@ -399,12 +511,71 @@ fn build_components(inputs: &Inputs) -> wordpress_vulnerable_scanner::Result<Vec
         }
     }
 
+    if let Some(ref path) = inputs.inventory {
+        components.extend(inventory_components(
+            path,
+            inputs.aliases.as_deref(),
+            keep_unversioned,
+        )?);
+    }
+
     // Check we have something to scan
     if components.is_empty() {
         return Err(wordpress_vulnerable_scanner::Error::NoInput);
     }
 
     Ok(components)
+}
+
+fn inventory_components(
+    path: &Path,
+    aliases: Option<&Path>,
+    keep_unversioned: bool,
+) -> wordpress_vulnerable_scanner::Result<Vec<ComponentInfo>> {
+    let inv = inventory::load(path)?;
+    let aliases = match aliases {
+        Some(p) => Aliases::load(p)?,
+        None => Aliases::default(),
+    };
+    let s = Style::stderr();
+    for w in aliases.check(&inv) {
+        eprintln!("{} {w}", s.yellow("warning:"));
+    }
+
+    let mut out = Vec::new();
+    if let Some(version) = inv.core.as_ref().and_then(|c| c.version.clone()) {
+        out.push(ComponentInfo {
+            component_type: ComponentType::Core,
+            slug: "wordpress".to_string(),
+            version: Some(version),
+        });
+    }
+    let mut unversioned = Vec::new();
+    for l in wordpress_vulnerable_scanner::aliases::lookups(&inv, &aliases) {
+        if l.version.is_none() && !keep_unversioned {
+            unversioned.push(l.slug);
+            continue;
+        }
+        out.push(ComponentInfo {
+            component_type: match l.kind {
+                Kind::Theme => ComponentType::Theme,
+                _ => ComponentType::Plugin,
+            },
+            slug: l.slug,
+            version: l.version,
+        });
+    }
+    if !unversioned.is_empty() {
+        eprintln!(
+            "{} {} not checked because no version could be read: {}. Without a version \
+             they cannot be compared with vulnerable version ranges; the inventory warnings \
+             say why each one has none.\n",
+            s.yellow("note:"),
+            unversioned.len(),
+            unversioned.join(", ")
+        );
+    }
+    Ok(out)
 }
 
 fn read_manifest(
@@ -489,7 +660,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             jobs,
             max_age,
         } => {
-            let items: Vec<(ComponentType, String)> = build_components(inputs)?
+            let items: Vec<(ComponentType, String)> = build_components(inputs, true)?
                 .into_iter()
                 .filter_map(|c| match c.component_type {
                     ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
@@ -502,7 +673,72 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 max_age: (*max_age > 0).then(|| Duration::from_secs(max_age * 3600)),
                 ..PullOptions::default()
             };
-            pull_cli(dir, &items, &opts).await
+            pull_cli("Pulling", dir, &items, &opts).await
+        }
+        DbCommand::Update {
+            db: dir,
+            api_url,
+            jobs,
+            max_age,
+            untracked_max_age,
+        } => {
+            let items = db::stored(dir)?;
+            if items.is_empty() {
+                return Err(wordpress_vulnerable_scanner::Error::Database(format!(
+                    "{} holds no records yet; run `db pull` first",
+                    dir.display()
+                )));
+            }
+            let hours = |h: u64| (h > 0).then(|| Duration::from_secs(h * 3600));
+            let opts = PullOptions {
+                api_url: api_url.clone(),
+                jobs: *jobs as usize,
+                max_age: hours(*max_age),
+                untracked_max_age: hours(*untracked_max_age),
+                ..PullOptions::default()
+            };
+            pull_cli("Updating", dir, &items, &opts).await
+        }
+        DbCommand::Verify {
+            db: dir,
+            inventory,
+            aliases,
+        } => verify_cli(dir, inventory.as_deref(), aliases.as_deref()),
+        DbCommand::Export { db: dir, output } => {
+            let m = wordpress_vulnerable_scanner::transfer::export(dir, output)?;
+            let s = Style::stdout();
+            println!(
+                "{} {} files from {} into {}",
+                s.bold("Exported"),
+                m.files.len(),
+                dir.display(),
+                output.display()
+            );
+            println!(
+                "Copy it to the offline machine, then: {}",
+                s.bold(&format!(
+                    "wordpress-vulnerable-scanner db import {}",
+                    output
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ))
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        DbCommand::Import { bundle, db: dir } => {
+            let done = wordpress_vulnerable_scanner::transfer::import(bundle, dir)?;
+            let s = Style::stdout();
+            println!(
+                "{} {} files into {}: every file matched the manifest and `db verify` passed",
+                s.bold("Imported"),
+                done.files,
+                dir.display()
+            );
+            if let Some(b) = done.backup {
+                println!("The previous database was moved to {}", b.display());
+            }
+            Ok(ExitCode::SUCCESS)
         }
         DbCommand::Status { db: dir, json } => {
             let st = db::status(dir)?;
@@ -516,6 +752,21 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 Some(ref m) => {
                     println!("  source      {}", m.source);
                     println!("  last pull   {}", ago(m.pulled_at));
+                    match st.indexed {
+                        Some(n) => println!(
+                            "  format      {} (index: {n} records{})",
+                            m.format,
+                            match st.rebuilt {
+                                0 => String::new(),
+                                r => format!(", {r} rebuilt from files, download details unknown"),
+                            }
+                        ),
+                        None => println!(
+                            "  format      {} {}",
+                            m.format,
+                            s.dim("(no index yet; the next `db pull` adds one)")
+                        ),
+                    }
                 }
                 None => println!("  {}", s.yellow("not a database yet; run `db pull` first")),
             }
@@ -530,8 +781,22 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
                 );
             }
             println!("  records     {}", st.records);
-            if let Some(t) = st.oldest {
-                println!("  oldest file {}", ago(t));
+            match (st.indexed, st.oldest_check, st.oldest) {
+                (Some(_), Some(t), _) => println!("  oldest check {}", ago(t)),
+                (None, _, Some(t)) => println!(
+                    "  oldest file {} {}",
+                    ago(t),
+                    s.dim("(file times reset when a database is copied)")
+                ),
+                _ => {}
+            }
+            if st.unconfirmed > 0 {
+                println!(
+                    "  {} {} never confirmed: rebuilt from files, so when they were fetched is \
+                     unknown. `db update` re-checks them.",
+                    s.yellow("unconfirmed"),
+                    st.unconfirmed
+                );
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -539,6 +804,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
 }
 
 async fn pull_cli(
+    verb: &str,
     dir: &Path,
     items: &[(ComponentType, String)],
     opts: &PullOptions,
@@ -554,7 +820,7 @@ async fn pull_cli(
     let digits = total.to_string().len();
     println!(
         "{} {} component{} from {} into {} ({} parallel)\n",
-        s.bold("Pulling"),
+        s.bold(verb),
         total,
         if total == 1 { "" } else { "s" },
         opts.api_url,
@@ -571,6 +837,10 @@ async fn pull_cli(
                 format!("{n} record{}", if *n == 1 { "" } else { "s" }),
             ),
             PullStatus::Fresh(n) => (s.dim("="), s.dim(&format!("{n} records, up to date"))),
+            PullStatus::Unchanged(n) => (
+                s.dim("="),
+                s.dim(&format!("{n} records, unchanged (confirmed by the API)")),
+            ),
             PullStatus::NoData => (
                 s.yellow("?"),
                 s.yellow("not tracked by WPVulnerability (not checked)"),
@@ -604,6 +874,9 @@ async fn pull_cli(
     if summary.fresh > 0 {
         parts.push(format!("{} up to date", summary.fresh));
     }
+    if summary.unchanged > 0 {
+        parts.push(format!("{} unchanged", summary.unchanged));
+    }
     if summary.no_data > 0 {
         parts.push(s.yellow(&format!("{} not tracked", summary.no_data)));
     }
@@ -625,6 +898,7 @@ async fn pull_cli(
             s.yellow("Re-run the same command to retry the failed ones; saved records are kept.")
         );
     }
+    print_changes(&s, dir, &summary.changes, verb == "Updating");
     println!(
         "Scan offline with: {}",
         s.bold(&format!(
@@ -638,6 +912,136 @@ async fn pull_cli(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn verify_cli(
+    dir: &Path,
+    inventory: Option<&Path>,
+    aliases: Option<&Path>,
+) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    let needed: Vec<(ComponentType, String)> = match inventory {
+        Some(path) => inventory_components(path, aliases, true)?
+            .into_iter()
+            .filter_map(|c| match c.component_type {
+                ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
+                kind => Some((kind, c.slug)),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let v = db::verify(dir, &needed);
+    let s = Style::stdout();
+    println!("{} {}", s.bold("Verifying"), dir.display());
+    println!("  {} record files checked", v.records);
+    if v.untracked > 0 {
+        println!(
+            "  {} untracked {}",
+            v.untracked,
+            s.dim(
+                "(not a problem: WPVulnerability has no entry for them, so they are not checked)"
+            )
+        );
+    }
+    if let Some(path) = inventory {
+        println!(
+            "  {} lookups needed by {}, {} missing",
+            needed.len(),
+            path.display(),
+            v.missing.len()
+        );
+    }
+    if !v.problems.is_empty() {
+        println!("\n{} ({})", s.red("Problems"), v.problems.len());
+        let digits = v.problems.len().to_string().len();
+        for (i, p) in v.problems.iter().enumerate() {
+            let indent = " ".repeat(digits + 4);
+            println!(
+                "  {} {}",
+                s.dim(&format!("{:>digits$}.", i + 1)),
+                wrap(p, 96 - indent.len()).join(&format!("\n{indent}"))
+            );
+        }
+    }
+    if !v.missing.is_empty() {
+        println!(
+            "\n{} ({}): {}",
+            s.red("Missing for the inventory"),
+            v.missing.len(),
+            v.missing.join(", ")
+        );
+        println!(
+            "  They were never pulled, so a scan would report them as not checked. Fix with:\n  \
+             wordpress-vulnerable-scanner db pull --db {} --inventory {}{}",
+            dir.display(),
+            inventory
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            aliases
+                .map(|a| format!(" --aliases {}", a.display()))
+                .unwrap_or_default()
+        );
+    }
+    if v.ok() {
+        println!(
+            "\n{}",
+            s.green("OK: every record matches what was downloaded.")
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+/// The "what is new since last time" view of a pull or update
+fn print_changes(s: &Style, dir: &Path, changes: &[Change], always: bool) {
+    if changes.is_empty() {
+        if always {
+            println!("\n{}", s.bold("No changes since the last check."));
+        }
+        return;
+    }
+    println!("\n{}", s.bold("Changes since the last check"));
+    let width = changes
+        .iter()
+        .map(|c| c.key.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(48);
+    for c in changes {
+        let what = c
+            .cves
+            .first()
+            .map(|cve| format!("{cve}: "))
+            .unwrap_or_default()
+            + c.title.as_deref().or(c.uuid.as_deref()).unwrap_or_default();
+        let (mark, text) = match c.change {
+            ChangeKind::Added => (s.red("+"), format!("{what} (new vulnerability)")),
+            ChangeKind::Removed => (
+                s.green("-"),
+                format!("{what} (withdrawn or merged upstream)"),
+            ),
+            ChangeKind::Changed => (
+                s.yellow("~"),
+                format!("{what} (details changed: affected versions, score or references)"),
+            ),
+            ChangeKind::NowTracked => (
+                s.green("!"),
+                "now tracked by WPVulnerability: it is checked from now on".to_string(),
+            ),
+            ChangeKind::NoLongerTracked => (
+                s.red("!"),
+                "no longer tracked by WPVulnerability: it is not checked any more".to_string(),
+            ),
+        };
+        println!("  {mark} {:<width$}  {text}", c.key);
+    }
+    println!(
+        "{}",
+        s.dim(&format!(
+            "Logged in {}",
+            dir.join("changes").join("<date>.json").display()
+        ))
+    );
 }
 
 fn run_inventory(args: &InventoryArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {

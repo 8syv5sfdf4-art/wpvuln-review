@@ -34,7 +34,9 @@ pub enum Error {
     VulnApi(String),
 
     /// No input provided (no URL, plugins, themes, or manifest)
-    #[error("no input provided: specify a URL, --plugins, --themes, --core, or --manifest")]
+    #[error(
+        "no input provided: specify a URL, --plugins, --themes, --core, --manifest, or --inventory"
+    )]
     NoInput,
 
     /// Failed to read manifest file
@@ -72,6 +74,10 @@ pub enum Error {
     /// Inventory could not be taken
     #[error("inventory failed: {0}")]
     Inventory(String),
+
+    /// Local database is unusable (unknown format, unreadable index)
+    #[error("local database: {0}")]
+    Database(String),
 
     /// Aliases file could not be read or is invalid
     #[error("invalid aliases file: {0}")]

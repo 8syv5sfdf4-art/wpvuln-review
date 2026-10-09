@@ -226,8 +226,26 @@ wordpress-vulnerable-scanner --db wpvuln-db --plugins-file plugins.csv
 wordpress-vulnerable-scanner db status
 ```
 
-`db pull` takes the same inputs as a scan (`-p`, `-t`, `-c`, `-m`, list files)
-and:
+With an inventory, the whole site is one input, and aliases decide what is
+looked up:
+
+```bash
+# on the server (no network)
+wordpress-vulnerable-scanner inventory /var/www/html -o inventory.json
+
+# where the internet works
+wordpress-vulnerable-scanner db pull --inventory inventory.json --aliases aliases.toml
+
+# anywhere, offline
+wordpress-vulnerable-scanner --db wpvuln-db --inventory inventory.json --aliases aliases.toml
+```
+
+Scans leave out inventory components whose version could not be read, and say
+so, since they cannot be compared with vulnerable version ranges. `db pull`
+still fetches their records.
+
+`db pull` takes the same inputs as a scan (`-p`, `-t`, `-c`, `-m`, list files,
+`--inventory`) and:
 
 - runs a few requests in parallel (`-j`, default 4) with a short pause between
   them, since WPVulnerability is a free service
@@ -239,15 +257,79 @@ and:
   plugins). Not-tracked components are stored too, and offline scans list them
   as "not checked" rather than letting them look clean
 
-Each record is the raw API response, one file per component:
+Each record is the raw API response, one file per component, and `index.json`
+records where each one came from:
 
 ```text
 wpvuln-db/
-├── wpvuln-db.json          # format, source URL, last pull
+├── wpvuln-db.json          # format (2), source URL, last pull
+├── index.json              # per record: fetched/checked time, URL, HTTP status,
+│                           #   sha256, tracked or not, vulnerability uuids, ETag
 ├── plugin/<slug>.json
 ├── theme/<slug>.json
 └── core/<version>.json
 ```
+
+### Keeping it current
+
+```bash
+wordpress-vulnerable-scanner db update --db wpvuln-db
+```
+
+`db update` re-checks every stored record last confirmed more than
+`--max-age` hours ago (default 24), and untracked components after
+`--untracked-max-age` (default 168), since those rarely change. Requests are
+conditional (`If-None-Match` / `If-Modified-Since`), so an unchanged record
+costs the API almost nothing. A "not modified" answer only confirms a record
+whose file still matches its recorded sha256; a damaged file is downloaded again.
+
+Whenever a record's content changes, during `db update` or `db pull`, the
+difference is shown and appended to `wpvuln-db/changes/<date>.json`:
+
+```text
+Changes since the last check
+  + plugin/elementor   CVE-2026-1234: Elementor < 3.36 - XSS (new vulnerability)
+  ~ plugin/woocommerce CVE-2026-3589: ... (details changed: affected versions, score or references)
+  ! plugin/chaty-pro   now tracked by WPVulnerability: it is checked from now on
+```
+
+WPVulnerability's sponsor-only "last updates" endpoint could make updates
+incremental, but its response format cannot be verified without a key, so it
+is not used; the free path is a polite, conditional refresh.
+
+### Checking it
+
+```bash
+wordpress-vulnerable-scanner db verify --db wpvuln-db --inventory inventory.json --aliases aliases.toml
+```
+
+`db verify` checks that every record still matches the sha256 recorded when it
+was downloaded, that the index and the files agree, that nothing unexpected sits
+in the directory (such as leftovers of an interrupted write), and, with
+`--inventory`, that every lookup the inventory needs was pulled. Each problem says
+what it means and how to fix it; the exit code is 1 when there is any.
+
+### Moving it to an offline machine
+
+```bash
+# where the internet works
+wordpress-vulnerable-scanner db export --db wpvuln-db -o wpvuln-db.tar.gz
+
+# on the offline machine
+wordpress-vulnerable-scanner db import wpvuln-db.tar.gz --db wpvuln-db
+```
+
+`db export` only packs a database that passes `db verify`, and adds a
+`MANIFEST.json` with every file's sha256. `db import` unpacks into a temporary
+directory, refuses unsafe paths, links and oversized bundles, checks every file
+against the manifest and runs `db verify`; only then does it replace the target,
+keeping the previous database as `<dir>.bak-<time>`. If anything fails, the
+existing database is left untouched.
+
+A format 1 database (no index) still works for scans and is migrated by the next
+`db pull`. Records found without an index entry are indexed from the file but
+marked unconfirmed: copying a database resets file times, so nothing says how
+old they are, and the next pull or `db update` re-checks them.
 
 A scan with `--db` prints a note for components that are not tracked and a
 warning for components that were never pulled, since neither has been checked. `--db` and `--api-url`
