@@ -1,22 +1,60 @@
 # wordpress-vulnerable-scanner
 
-A fast, safe Rust CLI tool for detecting known CVE vulnerabilities in WordPress core, plugins, and themes using the WPVulnerability.net API.
+A command-line tool, written in Rust, that finds known vulnerabilities in the
+plugins, themes and core of a WordPress site. It reads what is installed
+straight from the files, looks the versions up in public vulnerability data
+(WPVulnerability, and optionally Wordfence Intelligence), and can do all of the
+checking offline. It is meant for people who audit WordPress sites, especially
+on servers that cannot reach the internet.
 
-[![Crates.io](https://img.shields.io/crates/v/wordpress-vulnerable-scanner.svg)](https://crates.io/crates/wordpress-vulnerable-scanner)
-[![Documentation](https://docs.rs/wordpress-vulnerable-scanner/badge.svg)](https://docs.rs/wordpress-vulnerable-scanner)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+One rule runs through the whole tool: **it never reports "clean" for something
+it did not actually check.** A plugin that no database knows about is reported
+as *not checked*, not as safe.
+
+## Contents
+
+- [Why offline](#why-offline)
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [The offline workflow](#the-offline-workflow)
+- [Input forms](#input-forms)
+- [Understanding the result](#understanding-the-result)
+- [CI and DefectDojo](#ci-and-defectdojo)
+- [Comparing sources](#comparing-sources)
+- [Honest limits](#honest-limits)
+- [Data sources and licensing](#data-sources-and-licensing)
+- [Development](#development)
+- [Complete example](#complete-example)
+- [Contributing and licence](#contributing-and-licence)
+
+## Why offline
+
+Production servers are often locked down: outbound traffic to security
+services is blocked. So the work is split. Read the installed versions on the
+server, where no network is needed. Fetch vulnerability data on a machine that
+has internet. Carry the data over and scan anywhere, with no network at all.
 
 ## Features
 
-- **Multiple input modes** - scan live sites, JSON manifests, or specify components directly
-- **Parallel API requests** - fast vulnerability lookups using concurrent requests
-- **Version-aware filtering** - only reports vulnerabilities affecting installed versions
-- **CVSS scoring** - severity levels (Critical/High/Medium/Low) from CVSS scores
-- **Multiple output formats** - human-readable tables or JSON for automation
-- **Exit codes** - integrate with CI/CD pipelines
-- **Security hardened** - URL encoding, file size limits, safe HTTP defaults
+- **Inventory** of installed plugins, themes, must-use plugins, drop-ins and
+  core, read from plugin headers the way WordPress does (no PHP, no WP-CLI
+  needed). Works on a WordPress root, `wp-content`, a plugins folder, or a
+  `.tar`/`.tar.gz`/`.zip` of one, without extracting it.
+- **Aliases** from an installed folder name to the real wordpress.org slug
+  (`my-plugin-pro2` -> `my-plugin-pro`), with suggestions checked against the
+  data.
+- **Local database** of WPVulnerability records: `db pull`, `db update` (with
+  a change log), `db status`, `db verify` (checksums), `db export` /
+  `db import` for moving it between machines.
+- **Wordfence Intelligence** as a second source, from wpprobe's keyless export
+  on GitHub or from the official API with a free key.
+- **Scanning** against one source or both, with an explicit state for every
+  component, and human, JSON, CSV, Markdown and DefectDojo output.
+- Optional WP-CLI enrichment of the inventory (active or inactive status) on
+  servers where WP-CLI is installed.
 
-## Installation
+## Install
 
 ### Pre-built binaries
 
@@ -39,429 +77,632 @@ cargo install wordpress-vulnerable-scanner
 
 ### Build from source
 
+Requirements: Rust 1.91.1 or newer (the `rust-version` in `Cargo.toml`), a C
+linker (`build-essential` on Debian/Ubuntu, `gcc` on most other distributions),
+and git. Install Rust with [rustup](https://rustup.rs) or your distribution's
+package.
+
 ```bash
 git clone https://github.com/robdotec/wordpress-vulnerable-scanner
 cd wordpress-vulnerable-scanner
 cargo build --release
+./target/release/wordpress-vulnerable-scanner --version
 ```
 
-## Quick Start
+The binary is `target/release/wordpress-vulnerable-scanner`. To put it on your
+`PATH` (in `~/.cargo/bin`), run `cargo install --path .`.
 
-### Scan a live WordPress site
+The name is long; a shell alias such as
+`alias wvs=wordpress-vulnerable-scanner` helps. The examples below use the full
+name.
+
+## Quick start
+
+Check one plugin version against the live WPVulnerability API:
 
 ```bash
-wordpress-vulnerable-scanner https://example.com
+wordpress-vulnerable-scanner scan -p akismet:5.0
 ```
 
-### Scan with auto-detected scheme
+```text
+WordPress Vulnerable Scanner v1.0.0
+by Robert F. Ecker <robert@robdotec.com>
 
-```bash
-wordpress-vulnerable-scanner example.com
+MEDIUM (1)
+┌───────────┬─────────┬──────────────────────────────────────────────────────────┬─────────┐
+│ Component ┆ Version ┆ Vulnerability                                            ┆ Fixed   │
+╞═══════════╪═════════╪══════════════════════════════════════════════════════════╪═════════╡
+│ akismet   ┆ 5.0     ┆ CVE-2026-10001: Akismet < 5.0.2 - Stored Cross-Site S... ┆ >=5.0.2 │
+└───────────┴─────────┴──────────────────────────────────────────────────────────┴─────────┘
+
+Summary: 0 Critical, 0 High, 1 Medium, 0 Low; 1 components: 1 vulnerable, 0 clean, 0 not checked
 ```
 
-### Check specific components
+All sample output in this README comes from a demo site and **made-up demo
+records** served through a local mirror (`WPVULN_API`), so it is reproducible.
+`CVE-2026-1000x` are not real CVEs.
 
-```bash
-# Check WordPress core version
-wordpress-vulnerable-scanner -c 6.4.1
+`scan` is the default command, so the same check works without the word
+`scan`; this README always writes it.
 
-# Check plugins (slug:version format)
-wordpress-vulnerable-scanner -p "elementor:3.18.0,contact-form-7:5.8"
+A version with no known vulnerability prints:
 
-# Check themes
-wordpress-vulnerable-scanner -t "flavor:1.3.4,flavor-developer:1.3.4"
-
-# Combined check
-wordpress-vulnerable-scanner -c 6.4.1 -p "elementor:3.18.0" -t "flavor:1.3.4"
+```text
+No vulnerabilities found.
 ```
 
-### Use JSON manifest from wordpress-audit
+That means: the data source knows this plugin, and none of its recorded
+vulnerabilities affects this version. It does **not** mean the plugin is safe;
+only published vulnerabilities are known. A plugin the source does not know
+is never reported that way:
 
 ```bash
-# First, audit a WordPress installation
-wordpress-audit https://example.com -o json > manifest.json
-
-# Then scan for vulnerabilities
-wordpress-vulnerable-scanner -m manifest.json
+wordpress-vulnerable-scanner scan -p my-custom-plugin:1.0.0
 ```
 
-### Filter by severity
+```text
+...
+No vulnerabilities found in the 0 components that could be checked.
 
-```bash
-# Only show high and critical vulnerabilities
-wordpress-vulnerable-scanner example.com --severity high
+NOT CHECKED (1): not known to be safe, review by hand
+  not tracked (1): the data source has no entry (common for premium and custom code)
+    my-custom-plugin 1.0.0
+...
 ```
 
-### JSON output for automation
+## The offline workflow
 
-```bash
-wordpress-vulnerable-scanner example.com -o json | jq '.summary'
+```mermaid
+flowchart LR
+  S["Production server<br/>(no outbound network)<br/>inventory"]
+  I["Machine with internet<br/>db pull, db update<br/>db wordfence pull<br/>db export"]
+  O["Scanning machine<br/>db import<br/>scan"]
+  S -- "inventory.json" --> I
+  I -- "wpvuln-db.tar.gz" --> O
+  S -- "inventory.json" --> O
 ```
 
-## Input Modes
+The scanning machine can be the machine with internet; the point is that the
+server only reads files and the scan needs no network.
 
-| Mode | Flag | Description |
-|------|------|-------------|
-| URL scan | (positional) | Scan a live WordPress site |
-| Core version | `-c, --core` | Check specific WordPress version |
-| Plugins | `-p, --plugins` | Check plugins (slug:version,...) |
-| Themes | `-t, --themes` | Check themes (slug:version,...) |
-| Plugin list file | `--plugins-file` | One `slug:version` per line |
-| Theme list file | `--themes-file` | One `slug:version` per line |
-| Manifest | `-m, --manifest` | JSON file from wordpress-audit |
-
-List files accept `slug:version`, `slug version` or `slug,version`, skip blank
-lines and `#` comments, and read the CSV printed by WP-CLI directly:
+### 1. Inventory, on the server
 
 ```bash
-wp plugin list --fields=name,version --format=csv > plugins.csv
-wordpress-vulnerable-scanner --plugins-file plugins.csv
-```
-
-## Inventory: list what is installed
-
-`inventory` reads versions straight from the files, the way WordPress itself
-does (plugin headers in the first 8 KiB of each file, theme `style.css`,
-`wp-includes/version.php`), so it matches wp-admin. It never runs PHP and never
-touches the network, so it works on locked-down servers:
-
-```bash
-# a WordPress root, wp-content, or a plugins directory
 wordpress-vulnerable-scanner inventory /var/www/html -o inventory.json
-
-# or an archive, read in place without extracting (.tar, .tar.gz/.tgz, .zip)
-tar czf plugins.tar.gz -C /var/www/html/wp-content plugins
-wordpress-vulnerable-scanner inventory plugins.tar.gz --format list > plugins.txt
-wordpress-vulnerable-scanner --plugins-file plugins.txt
 ```
 
-`--format json` (the default) records plugins, must-use plugins, drop-ins,
-themes (with their parent theme), core, and header details such as the text
-domain and plugin URI. `--format list` prints `slug:version` lines for
-`--plugins-file`; add `--type theme` or `--type core` for the other lists.
+Give it a WordPress root, a `wp-content` folder, a plugins folder, or an
+archive of one (`tar czf site.tar.gz site` and then `inventory site.tar.gz`).
+It reads only the first 8 KiB of each candidate file, like WordPress does, and
+never runs PHP. A short summary goes to stderr:
 
-When a plugin has no `Version` header, the `Stable tag` from its `readme.txt` is
-used instead, marked `"version_source": "readme"` and with a warning to confirm
-it. Header versions are `"header"`.
+```text
+Inventory site (wordpress layout): 5 plugins, 1 theme, core 6.6.2
+```
 
-Plugin copies sitting one folder too deep (say `plugins/Old Plugins/elementor/`)
-are not loaded by WordPress, but their files are still on disk and may be
-reachable over the web. They are listed as type `unloaded` and included in the
-plugin list (after a `#` comment), so they get scanned too.
+`--format list` prints `slug:version` lines instead of JSON (`--type theme`
+or `--type core` for the other lists):
 
-Files alone cannot tell whether a plugin is active. Where WP-CLI is installed,
-`--with-wp-cli` (plus `--wp-path DIR` and `--allow-root` if needed) adds each
-component's `status` and `update_version` from `wp plugin list` and
-`wp theme list`. Versions still come from the files; if WP-CLI fails, the
-inventory is kept as is and the failure is reported.
+```text
+akismet:5.0
+elementor:3.20.0
+my-custom-plugin:1.0.0
+my-plugin-pro2:2.1.0
+woocommerce:10.3.7
+```
 
-Anything the inventory could not resolve is listed as a warning on stderr (and in the
-JSON) instead of being skipped silently: folders without a plugin header,
-missing versions, folders with several plugin headers, symlinks leaving the
-tree, and unsafe archive paths. Each warning says what it means for the scan
-and what to do about it.
+Anything it could not resolve (a folder without a plugin header, a missing
+version, archives left in the plugins folder) is listed as a warning that says
+what it means. Where WP-CLI is installed, `--with-wp-cli` adds each
+component's status from the WordPress database.
 
-## Aliases: folder name to wordpress.org slug
+### 2. Aliases
 
-Vulnerability data is keyed by wordpress.org slug, but WordPress folders are
-often named differently: premium editions (`chaty-pro2`), backup copies
-(`elementor2`), or plugins that ship with a theme (`woodmart-plus`). Without a
-mapping those look untracked and are not checked. Write the mapping by hand in
-`aliases.toml`:
+Vulnerability data is keyed by wordpress.org slug, but folders are sometimes
+renamed (`my-plugin-pro2`). `aliases suggest` proposes mappings and prints them
+as TOML for you to review; it never changes any file:
+
+```bash
+wordpress-vulnerable-scanner aliases suggest inventory.json --online > aliases-suggested.toml
+```
+
+```text
+...
+# my-plugin-pro2: My Plugin Pro 2.1.0 (my-plugin-pro2/my-plugin-pro.php)
+#   own slug: not tracked
+#   my-plugin-pro2 = "my-plugin-pro": tracked, 1 record; dropped trailing digits; Text Domain header
+#   my-plugin-pro2 = "my-plugin": not tracked; dropped trailing digits, dropped "-pro"
+"my-plugin-pro2" = "my-plugin-pro"
+Suggestions for 2 components: 1 confirmed, 0 to review, 1 without candidates
+```
+
+Only candidates the data confirms become active lines. `--online` asks the
+API; `--db DIR` checks a local database instead. Copy the lines you agree with
+into `aliases.toml`:
 
 ```toml
 [plugin]
-"chaty-pro2" = "chaty"
-"yith-woocommerce-product-bundles-premium" = "yith-woocommerce-product-bundles"
-"woodmart-plus" = { theme = "woodmart" }   # covered by the theme's own check
-
-[theme]
-"flatsome-old" = "flatsome"
+"my-plugin-pro2" = "my-plugin-pro"
 ```
+
+A plugin that ships with a theme can point at it with
+`"my-theme-addons" = { theme = "my-theme" }`.
+
+### 3. Build and update the database, on a machine with internet
 
 ```bash
-wordpress-vulnerable-scanner inventory plugins.tar.gz --aliases aliases.toml --format list
+wordpress-vulnerable-scanner db pull --db wpvuln-db --inventory inventory.json --aliases aliases.toml
 ```
-
-`aliases suggest` proposes entries. It never writes a file; it prints TOML to
-review:
-
-```bash
-wordpress-vulnerable-scanner aliases suggest inventory.json --db wpvuln-db > suggested.toml
-```
-
-Candidates come from the folder name (lowercased; `-premium`, `-pro`, `-old`,
-`-main`, `-master`, `--` and trailing digits dropped), the Text Domain header,
-a Plugin URI on wordpress.org, and plugins named after an installed theme. With
-`--db`, components already tracked under their own slug are skipped, and only a
-candidate the database tracks becomes an active line; everything else stays
-commented out with the reason. Components with no candidate at all are listed
-too, so custom code is never silently assumed covered.
-
-Add `--online` to ask the API about slugs the local database does not have
-(politely, 4 at a time). The answers go to a temporary directory that is
-deleted afterwards, so `--db` is never modified.
-
-With `--aliases` the inventory records each component's `lookup_slug` (and
-`lookup_type` for the `{ theme = ... }` form), and the list output uses the
-lookup slug with a comment naming the installed folder. Matches found through
-an alias should be confirmed: premium editions do not always number their
-versions like the free plugin. Entries that cannot work (the plugin is not
-installed, or the target theme is missing) are reported as warnings.
-
-## Offline scans (local database)
-
-For air-gapped servers, CI without outbound access, or simply to avoid
-re-querying the API, pull the records for your components once and scan
-from disk:
-
-```bash
-# 1. where the internet works: download records into ./wpvuln-db
-wordpress-vulnerable-scanner db pull --plugins-file plugins.csv
-
-# 2. anywhere, offline (copy the wpvuln-db directory along)
-wordpress-vulnerable-scanner --db wpvuln-db --plugins-file plugins.csv
-
-# what's in the database
-wordpress-vulnerable-scanner db status
-```
-
-With an inventory, the whole site is one input, and aliases decide what is
-looked up:
-
-```bash
-# on the server (no network)
-wordpress-vulnerable-scanner inventory /var/www/html -o inventory.json
-
-# where the internet works
-wordpress-vulnerable-scanner db pull --inventory inventory.json --aliases aliases.toml
-
-# anywhere, offline
-wordpress-vulnerable-scanner --db wpvuln-db --inventory inventory.json --aliases aliases.toml
-```
-
-Scans leave out inventory components whose version could not be read, and say
-so, since they cannot be compared with vulnerable version ranges. `db pull`
-still fetches their records.
-
-`db pull` takes the same inputs as a scan (`-p`, `-t`, `-c`, `-m`, list files,
-`--inventory`) and:
-
-- runs a few requests in parallel (`-j`, default 4) with a short pause between
-  them, since WPVulnerability is a free service
-- retries timeouts, HTTP 429 and 5xx, and keeps going when one component fails;
-  re-run the same command to retry only what's missing
-- skips records newer than `--max-age <hours>`
-- tells three cases apart: tracked with vulnerabilities, tracked with none, and
-  **not tracked** (WPVulnerability has no entry, common for premium and custom
-  plugins). Not-tracked components are stored too, and offline scans list them
-  as "not checked" rather than letting them look clean
-
-Each record is the raw API response, one file per component, and `index.json`
-records where each one came from:
 
 ```text
-wpvuln-db/
-├── wpvuln-db.json          # format (2), source URL, last pull
-├── index.json              # per record: fetched/checked time, URL, HTTP status,
-│                           #   sha256, tracked or not, vulnerability uuids, ETag
-├── plugin/<slug>.json
-├── theme/<slug>.json
-└── core/<version>.json
+...
+  [1/7] ✓ core 6.6.2             tracked, no known vulnerabilities
+  [2/7] ✓ elementor         2 records
+  [3/7] ? my-custom-plugin  not tracked by WPVulnerability (not checked)
+  [4/7] ✓ akismet           1 record
+  [5/7] ✓ my-plugin-pro     1 record
+  [6/7] ✓ woocommerce       1 record
+  [7/7] ✓ theme twentytwentyfour  tracked, no known vulnerabilities
+
+Done in 527ms: 6 saved (5 records), 1 not tracked
+...
 ```
 
-### Keeping it current
+Later, re-check what is stale and see what changed (conditional requests, so
+unchanged records cost almost nothing):
 
 ```bash
 wordpress-vulnerable-scanner db update --db wpvuln-db
-```
-
-`db update` re-checks every stored record last confirmed more than
-`--max-age` hours ago (default 24), and untracked components after
-`--untracked-max-age` (default 168), since those rarely change. Requests are
-conditional (`If-None-Match` / `If-Modified-Since`), so an unchanged record
-costs the API almost nothing. A "not modified" answer only confirms a record
-whose file still matches its recorded sha256; a damaged file is downloaded again.
-
-Whenever a record's content changes, during `db update` or `db pull`, the
-difference is shown and appended to `wpvuln-db/changes/<date>.json`:
-
-```text
-Changes since the last check
-  + plugin/elementor   CVE-2026-1234: Elementor < 3.36 - XSS (new vulnerability)
-  ~ plugin/woocommerce CVE-2026-3589: ... (details changed: affected versions, score or references)
-  ! plugin/chaty-pro   now tracked by WPVulnerability: it is checked from now on
-```
-
-WPVulnerability's sponsor-only "last updates" endpoint could make updates
-incremental, but its response format cannot be verified without a key, so it
-is not used; the free path is a polite, conditional refresh.
-
-### Checking it
-
-```bash
+wordpress-vulnerable-scanner db status --db wpvuln-db
 wordpress-vulnerable-scanner db verify --db wpvuln-db --inventory inventory.json --aliases aliases.toml
 ```
 
-`db verify` checks that every record still matches the sha256 recorded when it
-was downloaded, that the index and the files agree, that nothing unexpected sits
-in the directory (such as leftovers of an interrupted write), and, with
-`--inventory`, that every lookup the inventory needs was pulled. Each problem says
-what it means and how to fix it; the exit code is 1 when there is any.
+`db update` re-checks records older than `--max-age` hours (default 24;
+untracked ones after `--untracked-max-age`, default 168) and appends changes to
+`wpvuln-db/changes/<date>.json`. `db verify` checks every record against the
+sha256 recorded at download and that the inventory is fully covered:
 
-### Moving it to an offline machine
+```text
+Verifying wpvuln-db
+  7 record files checked
+  1 untracked (not a problem: WPVulnerability has no entry for them, so they are not checked)
+  7 lookups needed by inventory.json, 0 missing
+
+OK: every record matches what was downloaded.
+```
+
+### 4. Optional: Wordfence as a second source
 
 ```bash
-# where the internet works
-wordpress-vulnerable-scanner db export --db wpvuln-db -o wpvuln-db.tar.gz
+wordpress-vulnerable-scanner db wordfence pull --db wpvuln-db
+```
 
-# on the offline machine
+```text
+Pulling Wordfence data from GitHub (no key set; WORDFENCE_API_KEY or --api-key selects the official API)
+Saved in 163.7s: 43949 records, 17543 slugs, 24.2 MB (wpprobe format: records with a CVE only)
+...
+```
+
+(This one is a real run against the real file.) Without a key the tool
+downloads wpprobe's export of Wordfence data from GitHub (records with a CVE
+only). A second pull is cheap when nothing changed: the server answers "not
+modified". With a free Wordfence Intelligence key
+it uses the official feed instead (larger, includes records without a CVE):
+
+```bash
+export WORDFENCE_API_KEY=...   # wordfence.com > Account > Integrations
+wordpress-vulnerable-scanner db wordfence pull --db wpvuln-db --from api
+```
+
+The API allows about one full download per 30 minutes per key; a second
+`--from api` pull within that time is skipped unless you add `--force`. The
+feed is stored in `wpvuln-db/wordfence/` together with `wordfence.NOTICE.txt`
+(see [Data sources and licensing](#data-sources-and-licensing)). A feed file
+obtained some other way can be added with
+`db wordfence import <file> --db wpvuln-db`.
+
+### 5. Move the database
+
+```bash
+wordpress-vulnerable-scanner db export --db wpvuln-db -o wpvuln-db.tar.gz
+# copy the file over, then on the scanning machine:
 wordpress-vulnerable-scanner db import wpvuln-db.tar.gz --db wpvuln-db
 ```
 
-`db export` only packs a database that passes `db verify`, and adds a
-`MANIFEST.json` with every file's sha256. `db import` unpacks into a temporary
-directory, refuses unsafe paths, links and oversized bundles, checks every file
-against the manifest and runs `db verify`; only then does it replace the target,
-keeping the previous database as `<dir>.bak-<time>`. If anything fails, the
-existing database is left untouched.
+```text
+Imported 12 files into wpvuln-db: every file matched the manifest and `db verify` passed
+The previous database was moved to ./wpvuln-db.bak-2026-10-07T130740Z
+```
 
-A format 1 database (no index) still works for scans and is migrated by the next
-`db pull`. Records found without an index entry are indexed from the file but
-marked unconfirmed: copying a database resets file times, so nothing says how
-old they are, and the next pull or `db update` re-checks them.
+Export refuses a database that fails `db verify`. Import unpacks into a
+temporary folder, rejects unsafe paths and anything not listed in the
+manifest, checks every sha256, runs `db verify`, and only then replaces the
+target, keeping the previous one as a backup.
 
-### What a scan says about each component
-
-Every component ends in exactly one state, in the JSON (`state`) and the report:
-
-| State | Meaning |
-|---|---|
-| `vulnerable` | tracked, and the installed version is in an affected range |
-| `alias_match` | the same, but found through an alias: confirm before acting |
-| `clean` | tracked, and no affected range contains the installed version |
-| `untracked` | the data source has no entry: **not checked** |
-| `not_in_db` | never pulled into the local database: **not checked** |
-| `unknown_version` | no version could be read: **not checked** |
-| `failed` | the lookup failed (network error, damaged record): **not checked** |
-
-The summary counts unchecked components next to the vulnerabilities, so
-"0 vulnerabilities, 12 not checked" cannot be mistaken for a clean bill of
-health. This applies to live API scans as well as `--db` scans.
-
-When a component is not checked only because of its name (a renamed, premium
-or backup copy such as `elementor2` or `wp-rocket--`), the report says so: with
-`--db`, it looks up the likely original slugs in the database and prints the
-exact `aliases.toml` line (`suggested_alias` in JSON and CSV, tagged
-`naming-problem` in DefectDojo). Problems with the inputs themselves (alias
-entries that cannot work, what the inventory could not resolve) are listed in a
-WARNINGS section of the report and in `warnings` in the JSON, not just on
-stderr.
-
-`db pull` and `db update` end the same way: what is not tracked, split into
-probable naming problems (with the alias line), possible ones (with the command
-to check them) and code no database covers; what failed and why; names that
-are not usable slugs; and warnings about the inputs. `--db` and `--api-url`
-(for a self-hosted mirror) can also be set with `WPVULN_DB` and `WPVULN_API`.
-
-## Output Formats
-
-| Format | Flag | Description |
-|--------|------|-------------|
-| Human | `-o human` | Colored table (default) |
-| JSON | `-o json` | Machine-readable JSON, with a `state` per component |
-| CSV | `-o csv` | One row per finding, plus one per component without findings |
-| Markdown | `-o markdown` | Report for people: summary, findings, alias matches, not checked |
-| DefectDojo | `-o defectdojo` | DefectDojo "Generic Findings Import" JSON |
-| None | `-o none` | Silent (exit code only) |
-
-Every format accounts for every component, including the ones that could not
-be checked, with the reason. `--severity` hides lower findings from the human,
-CSV and Markdown reports; JSON always holds everything.
-
-### DefectDojo
+### 6. Scan offline
 
 ```bash
-wordpress-vulnerable-scanner scan --db wpvuln-db --inventory inventory.json \
-    --aliases aliases.toml -o defectdojo > findings.json
+# WPVulnerability only
+wordpress-vulnerable-scanner scan --db wpvuln-db --inventory inventory.json --aliases aliases.toml
+
+# Wordfence only (no --db: no network at all)
+wordpress-vulnerable-scanner scan --wordfence wpvuln-db/wordfence/wordfence.json --inventory inventory.json --aliases aliases.toml
+
+# Both sources combined (`auto` = <db>/wordfence/wordfence.json)
+wordpress-vulnerable-scanner scan --db wpvuln-db --wordfence auto --inventory inventory.json --aliases aliases.toml
 ```
 
-Import `findings.json` as scan type **Generic Findings Import**. Only fields
-DefectDojo 3 documents are used, since any other key aborts the import:
-title, severity, description, CVE (and further ids), CVSS v3 vector and score,
-CWE, component name and version, references, fix availability and version,
-mitigation, KEV, EPSS and tags. `unique_id_from_tool` is stable
-(`plugin/<installed slug>/<record uuid>`), so re-imports deduplicate.
-Components that could not be checked become **Info** findings tagged
-`not-checked`, and findings through an alias are tagged `alias-match` and left
-unverified, so neither gets lost in the tracker.
+Without `--db` and `--wordfence`, `scan` asks the live WPVulnerability API.
 
-## Exit Codes
+## Input forms
+
+| Input | Example | Notes |
+|---|---|---|
+| `-p, --plugins` | `-p akismet:5.0,elementor:3.20.0` | comma-separated `slug:version` |
+| `--plugins-file` | `--plugins-file plugins.txt` | one per line: `slug:version`, `slug version` or `slug,version`; `#` comments; reads `wp plugin list --fields=name,version --format=csv` |
+| `-t, --themes` | `-t twentytwentyfour:1.2` | like `-p` |
+| `--themes-file` | `--themes-file themes.txt` | like `--plugins-file` |
+| `-c, --core` | `-c 6.6.2` | WordPress version |
+| `--inventory` | `--inventory inventory.json` | an inventory file, or a folder or archive to inventory on the spot; with `--aliases` |
+| `-m, --manifest` | `-m manifest.json` | JSON from the upstream `wordpress-audit` tool |
+| URL | `wordpress-vulnerable-scanner https://example.com` | scans a live site's public pages to guess versions |
+
+The list inputs can be combined. A URL cannot: when a URL is given, `-p`, `-t`,
+`-c` and the other inputs are silently ignored.
+
+## Understanding the result
+
+### Component states
+
+Every component ends in exactly one state:
+
+| State | Checked? | Meaning |
+|---|---|---|
+| `vulnerable` | yes | the installed version is inside an affected range |
+| `alias_match` | yes | the same, found through an alias: confirm, premium versions may differ |
+| `clean` | yes | known to the source; no affected range contains the installed version |
+| `untracked` | **no** | no source has an entry (common for premium and custom code) |
+| `not_in_db` | **no** | never pulled into the local database |
+| `unknown_version` | **no** | no version could be read |
+| `failed` | **no** | the lookup failed (network error, damaged record) |
+
+With several sources, a component is "not checked" only when no source had
+data for it; the report says which source lacked it.
+
+### Output formats
+
+| `-o` | What you get |
+|---|---|
+| `human` (default) | tables by severity, alias matches, a NOT CHECKED list, a summary |
+| `json` | everything, including `state`, per-source `coverage`, and per finding `sources`, `ranges`, CVEs, CVSS, `fixed_in` |
+| `csv` | one row per finding, plus one row per component without findings |
+| `markdown` | a report for people |
+| `defectdojo` | DefectDojo "Generic Findings Import" JSON |
+| `none` | nothing; use the exit code |
+
+`--severity high` hides lower findings from the human, CSV and Markdown
+output; the summary still counts everything. Human output from the combined
+scan above:
+
+```text
+...
+CRITICAL (1)
+┌───────────────────────────────────┬─────────┬──────────────────────────────────────────────────────────┬─────────┐
+│ Component                         ┆ Version ┆ Vulnerability                                            ┆ Fixed   │
+╞═══════════════════════════════════╪═════════╪══════════════════════════════════════════════════════════╪═════════╡
+│ my-plugin-pro2 (as my-plugin-pro) ┆ 2.1.0   ┆ CVE-2026-10004: My Plugin Pro < 2.2.0 - Unauthenticat... ┆ >=2.2.0 │
+└───────────────────────────────────┴─────────┴──────────────────────────────────────────────────────────┴─────────┘
+...
+Found through an alias, confirm before acting
+  my-plugin-pro2 (as my-plugin-pro) 2.1.0: premium editions may number versions differently
+
+NOT CHECKED (1): not known to be safe, review by hand
+  not tracked (1): the data source has no entry (common for premium and custom code)
+    my-custom-plugin 1.0.0
+
+Summary: 1 Critical, 1 High, 3 Medium, 0 Low; 7 components: 4 vulnerable, 2 clean, 1 not checked
+Sources: WPVulnerability had no data for 1, Wordfence had no data for 3 (a component counts as not checked only when no source had data)
+...
+Vulnerability data from Wordfence Intelligence, Copyright (c) Defiant, Inc. (https://www.wordfence.com/wordfence-intelligence-terms-and-conditions/). CVE records Copyright (c) The MITRE Corporation.
+```
+
+The same scan as JSON (trimmed):
+
+```json
+{
+  "url": null,
+  "scan_date": "2026-10-07T13:04:18Z",
+  "components": [
+...
+    {
+      "component_type": "plugin",
+      "slug": "akismet",
+      "version": "5.0",
+      "vulnerabilities": [
+        {
+          "id": "CVE-2026-10001",
+          "title": "Akismet < 5.0.2 - Stored Cross-Site Scripting",
+          "severity": "medium",
+          "cvss_score": 6.1,
+...
+          "fixed_in": "5.0.2",
+...
+          "sources": [
+            "wpvulnerability"
+          ]
+        }
+      ],
+      "max_severity": "medium",
+      "state": "vulnerable",
+      "matched_via": "slug",
+...
+```
+
+### Exit codes
 
 | Code | Meaning |
-|------|---------|
-| 0 | No vulnerabilities found |
-| 1 | Vulnerabilities found (non-critical) |
-| 2 | Critical vulnerabilities found |
-| 10 | Error (network, parsing, etc.) |
+|---|---|
+| 0 | no vulnerabilities found |
+| 1 | vulnerabilities found |
+| 2 | at least one critical vulnerability found |
+| 10 | error (for example no input, a bad flag, an unreadable database or feed) |
 
-For CI, `--fail-on <none|low|medium|high|critical>` only lets findings at or
-above that severity fail the run (`none`: never), and `--fail-on-unchecked`
-exits 1 when nothing was found but some component could not be checked.
+**1 and 2 are results, not failures of the tool.** (`db pull` and `db update`
+exit 1 when some records could not be downloaded.) For CI:
 
-`wordpress-vulnerable-scanner scan ...` is the same as the top-level form; use
-whichever reads better in scripts.
+- `--fail-on <none|low|medium|high|critical>` lets only findings at or above
+  that severity make the exit code non-zero (`none`: never);
+- `--fail-on-unchecked` exits 1 when nothing was found but some component
+  could not be checked.
 
-## Severity Levels
+### jq cookbook
 
-Based on CVSS v3 scores:
+All of these run against `report.json` from
+`scan ... -o json > report.json`:
 
-| Level | CVSS Range | Color |
-|-------|------------|-------|
-| Critical | 9.0 - 10.0 | Red |
-| High | 7.0 - 8.9 | Orange |
-| Medium | 4.0 - 6.9 | Yellow |
-| Low | 0.1 - 3.9 | Green |
+```bash
+# The summary, including per-state counts
+jq '.summary' report.json
 
-## Security
+# Only what is vulnerable
+jq -r '.components[] | select(.vulnerabilities | length > 0) | "\(.installed_as // .slug) \(.version) \(.state): \([.vulnerabilities[].id] | join(", "))"' report.json
 
-### Input Validation
+# What was not checked, and why
+jq -r '.components[] | select(.state as $s | ["untracked","not_in_db","unknown_version","failed"] | index($s)) | "\(.slug) \(.version // "-") \(.state): \(.note)"' report.json
 
-- **URL encoding** - Component slugs are URL-encoded to prevent injection
-- **File size limits** - Manifest files limited to 10 MB to prevent memory exhaustion
-- **Safe HTTP defaults** - TLS verification enabled, reasonable timeouts
+# Findings per severity
+jq -r '[.components[].vulnerabilities[].severity] | group_by(.) | map("\(.[0]): \(length)") | .[]' report.json
 
-### Data Source
+# Which source reported each finding
+jq -r '.components[].vulnerabilities[] | "\(.id) \(.sources | join("+"))"' report.json
 
-Vulnerability data is fetched from [WPVulnerability.net](https://www.wpvulnerability.net/), a free CVE database for WordPress.
-
-## API Reference
-
-The scanner can also be used as a library:
-
-```rust
-use wordpress_vulnerable_scanner::{Analyzer, Scanner, Severity};
-use wordpress_vulnerable_scanner::output::{OutputConfig, OutputFormat, output_analysis};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Scan a site
-    let scanner = Scanner::new("https://example.com")?;
-    let scan_result = scanner.scan().await?;
-
-    // Analyze for vulnerabilities
-    let analyzer = Analyzer::new()?;
-    let analysis = analyzer.analyze(&scan_result).await;
-
-    // Output results
-    let config = OutputConfig::new(OutputFormat::Human, Severity::Low);
-    let mut stdout = std::io::stdout();
-    output_analysis(&analysis, &config, &mut stdout)?;
-
-    Ok(())
-}
+# What to update to
+jq -r '.components[] | .slug as $s | .vulnerabilities[] | select(.fixed_in) | "\($s): update to \(.fixed_in) or later (\(.id))"' report.json
 ```
 
-## License
+```text
+akismet 5.0 vulnerable: CVE-2026-10001
+elementor 3.20.0 vulnerable: CVE-2026-10003
+my-plugin-pro2 2.1.0 alias_match: CVE-2026-10004, CVE-2026-10005
+woocommerce 10.3.7 vulnerable: CVE-2026-10002
+```
+
+## CI and DefectDojo
+
+A job that fails only on high or critical findings and keeps a file for
+DefectDojo:
+
+```bash
+set +e
+wordpress-vulnerable-scanner scan --db wpvuln-db --inventory inventory.json \
+  --aliases aliases.toml --fail-on high -o defectdojo > findings.json
+code=$?
+set -e
+case "$code" in
+  0) echo "No high or critical findings." ;;
+  1|2) echo "High or critical findings (exit $code), see findings.json."; exit 1 ;;
+  *) echo "Scanner error (exit $code)."; exit "$code" ;;
+esac
+```
+
+Import `findings.json` in DefectDojo as the scan type **Generic Findings
+Import**. Only fields DefectDojo documents are used. `unique_id_from_tool` is
+stable across runs, so re-imports deduplicate. Components that were not
+checked become `Info` findings tagged `not-checked`, and findings found through
+an alias are tagged `alias-match`.
+
+## Comparing sources
+
+Run the same inventory three ways and compare:
+
+```bash
+wordpress-vulnerable-scanner scan --db wpvuln-db --inventory inventory.json --aliases aliases.toml -o json > wpvulnerability.json
+wordpress-vulnerable-scanner scan --wordfence wpvuln-db/wordfence/wordfence.json --inventory inventory.json --aliases aliases.toml -o json > wordfence.json
+wordpress-vulnerable-scanner scan --db wpvuln-db --wordfence auto --inventory inventory.json --aliases aliases.toml -o json > both.json
+```
+
+In the combined report each finding lists the sources that reported it, and
+findings with the same CVE are merged. A finding is reported if **any** source
+says the installed version is affected.
+
+The sources model ranges differently. Wordfence stores one range per
+maintenance branch; WPVulnerability stores one range. When a fix is backported
+(say a WooCommerce flaw fixed in `10.4.3` and backported to `10.3.7`),
+WPVulnerability's single range (`<= 10.4.2`) marks `10.3.7` as affected, while
+Wordfence's branch ranges (`10.3.0 - 10.3.6`, `10.4.0 - 10.4.2`, ...) mark it
+clean. The combined scan does **not** resolve such disagreements yet; it
+reports the finding with `"sources": ["wpvulnerability"]`. To find candidates,
+look for findings one source reported for a component the other source tracks:
+
+```bash
+jq -r '.components[] | select(.coverage.wordfence == "tracked") | (.installed_as // .slug) as $s | .version as $v | .vulnerabilities[] | select(.sources | index("wordfence") | not) | "\($s) \($v): \(.id) only from \(.sources | join("+"))"' both.json
+```
+
+```text
+my-plugin-pro2 2.1.0: CVE-2026-10004 only from wpvulnerability
+woocommerce 10.3.7: CVE-2026-10002 only from wpvulnerability
+```
+
+Then check the records: Wordfence may simply have no record for that CVE, or
+it may consider the version patched.
+
+## Honest limits
+
+- **Untracked means not checked.** Premium, marketplace and custom plugins are
+  usually in no public database. They get no verdict and need a manual or code
+  review.
+- **Folder name is not always the slug.** Aliases fix that, but a wrong alias
+  gives a wrong answer, and premium editions do not always share the free
+  version's numbering.
+- **Versions come from plugin headers**, not from running PHP. A modified or
+  backdated header is not detected.
+- **Only known, published vulnerabilities are found.** No zero-days, no code
+  analysis. For source code scanning use a SAST tool such as Semgrep alongside
+  this one.
+- **Data is as fresh as your last `db pull` or `db update`.** `db status`
+  shows the age of the oldest check and of the Wordfence feed, and warns when
+  the feed is older than 7 days.
+- **The data comes from third parties**, some volunteer-run. Nothing is
+  guaranteed: a missing record is not proof of safety.
+
+## Data sources and licensing
+
+- **WPVulnerability** ([wpvulnerability.net](https://www.wpvulnerability.net))
+  is a free, volunteer-run database. Be polite: `db pull` defaults to 4
+  requests at a time (`-j`), a 250 ms pause before each request and 3 attempts
+  with backoff, and identifies itself with a `wordpress-vulnerable-scanner/<version>`
+  User-Agent.
+- **Wordfence Intelligence**: "Wordfence Intelligence, Copyright (c) Defiant,
+  Inc." Its data is used under the
+  [Wordfence Intelligence Terms and Conditions](https://www.wordfence.com/wordfence-intelligence-terms-and-conditions/).
+  Every pulled feed is stored with `<db>/wordfence/wordfence.NOTICE.txt`; that
+  file must travel with the data when you redistribute it (`db export`
+  includes it). Reports that use Wordfence data print the attribution. CVE
+  records are Copyright (c) The MITRE Corporation.
+- **wpprobe** ([Chocapikk/wpprobe](https://github.com/Chocapikk/wpprobe), MIT
+  licence) publishes the keyless Wordfence export used by
+  `db wordfence pull` without a key.
+
+This tool does not grant any rights to the data; check each source's terms.
+
+## Development
+
+```bash
+cargo test
+cargo fmt --all -- --check
+cargo clippy --all-features -- -D warnings
+cargo doc --no-deps --all-features
+```
+
+`.github/workflows/ci.yml` runs check, fmt, clippy, test and doc on GitHub
+Actions.
+
+```text
+src/
+  main.rs            command-line interface
+  lib.rs             library entry point
+  inventory.rs       reading installed versions from files and archives
+  aliases.rs         folder name to slug aliases and suggestions
+  scanner.rs         scanning a live site by URL
+  vulnerability.rs   WPVulnerability client, records, version ranges
+  wordfence.rs       parsing Wordfence feeds
+  wordfence_db.rs    storing a Wordfence feed in the database
+  db.rs              local database: pull, update, verify, status
+  changes.rs         change detection between snapshots
+  transfer.rs        db export / db import
+  archive.rs         path safety for untrusted archives
+  analyze.rs         matching components to vulnerabilities, states
+  output.rs          human and JSON output
+  report.rs          CSV, Markdown and DefectDojo output
+  error.rs           error types
+  http.rs            shared HTTP constants
+tests/               integration tests, fixtures and golden files
+```
+
+Network tests use a mock server ([wiremock](https://crates.io/crates/wiremock)),
+so they never reach the real services:
+
+```rust
+let server = wiremock::MockServer::start().await;
+wiremock::Mock::given(wiremock::matchers::path("/plugin/akismet/"))
+    .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+    .mount(&server)
+    .await;
+// then point the code at server.uri() instead of the real API
+```
+
+See `tests/offline_db.rs` and `tests/wordfence_pull.rs` for complete examples.
+Report output is pinned by golden files in `tests/golden/`; after an intended
+change, regenerate them with `UPDATE_GOLDEN=1 cargo test --test reports` and
+review the diff.
+
+## Complete example
+
+Inventory, both databases, one combined scan. This is a **real run** against
+the real services (WPVulnerability and the keyless Wordfence file) on a small
+test site with `akismet`, `elementor`, `woocommerce`, a custom plugin and a
+renamed copy:
+
+```bash
+wordpress-vulnerable-scanner inventory site -o inventory.json
+wordpress-vulnerable-scanner db pull --db wpvuln-db --inventory inventory.json
+wordpress-vulnerable-scanner db wordfence pull --db wpvuln-db
+wordpress-vulnerable-scanner scan --db wpvuln-db --wordfence auto --inventory inventory.json
+```
+
+```text
+Inventory site (wordpress layout): 5 plugins, 1 theme, core 6.6.2
+...
+  [1/7] ✓ akismet           4 records
+  [2/7] ? my-custom-plugin  not tracked by WPVulnerability (not checked)
+  [3/7] ✓ elementor         63 records
+  [4/7] ✓ core 6.6.2             22 records
+  [5/7] ? my-plugin-pro2    not tracked by WPVulnerability (not checked)
+  [6/7] ✓ theme twentytwentyfour  tracked, no known vulnerabilities
+  [7/7] ✓ woocommerce       98 records
+
+Done in 2s: 5 saved (187 records), 2 not tracked
+...
+Saved in 211.9s: 43949 records, 17543 slugs, 24.2 MB (wpprobe format: records with a CVE only)
+...
+HIGH (4)
+┌─────────────┬─────────┬──────────────────────────────────────────────────────────┬──────────┐
+│ Component   ┆ Version ┆ Vulnerability                                            ┆ Fixed    │
+╞═════════════╪═════════╪══════════════════════════════════════════════════════════╪══════════╡
+...
+│ woocommerce ┆ 10.3.7  ┆ CVE-2026-57777: WooCommerce [woocommerce] < 11.0         ┆ >=11.0   │
+...
+│ woocommerce ┆ 10.3.7  ┆ CVE-2026-48888: WooCommerce [woocommerce] < 11.1.0       ┆ >=11.1.0 │
+└─────────────┴─────────┴──────────────────────────────────────────────────────────┴──────────┘
+
+MEDIUM (46)
+...
+│ elementor   ┆ 3.20.0  ┆ CVE-2024-2117: Elementor Website Builder – more than...                 ┆ >=3.20.3       │
+...
+│ woocommerce ┆ 10.3.7  ┆ CVE-2025-15033: WooCommerce [woocommerce] < 10.4.3                      ┆ >=10.4.3       │
+...
+NOT CHECKED (2): not known to be safe, review by hand
+  not tracked (2): the data source has no entry (common for premium and custom code)
+    my-custom-plugin 1.0.0
+    my-plugin-pro2 2.1.0: the name looks like a renamed, premium or backup copy of "my-plugin": run `aliases suggest --online` to check
+  To find the right slugs for renamed or premium copies in one go:
+    wordpress-vulnerable-scanner aliases suggest <inventory.json> --db <db> --online
+
+Summary: 0 Critical, 4 High, 46 Medium, 3 Low; 7 components: 3 vulnerable, 2 clean, 2 not checked
+Sources: WPVulnerability had no data for 2, Wordfence had no data for 3 (a component counts as not checked only when no source had data)
+...
+```
+
+The exit code is 1 (vulnerabilities found, none critical). Two things to read
+from it: the custom plugin and the renamed copy are **not checked**, not
+clean; and `CVE-2025-15033` for WooCommerce 10.3.7 comes from WPVulnerability's
+single range, while Wordfence's per-branch ranges treat 10.3.7 as a patched
+backport (see [Comparing sources](#comparing-sources)).
+
+## Contributing and licence
+
+Contributions are welcome as pull requests. Keep commits focused, explain why
+in the message, and make sure the four commands under
+[Development](#development) pass.
 
 MIT License - see [LICENSE](LICENSE) for details.
