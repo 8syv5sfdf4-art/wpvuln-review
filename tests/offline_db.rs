@@ -525,3 +525,86 @@ fn scan_subcommand_and_exit_code_controls() {
         "no version"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_ends_with_explained_problems() {
+    let server = MockServer::start().await;
+    mount(&server, "/plugin/elementor/", 200, &record("")).await;
+    mount(&server, "/plugin/broken/", 500, "").await;
+    // everything else: 404, so not tracked
+    let dir = temp_db("pull-report");
+    let (db_dir, uri) = (dir.clone(), server.uri());
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+            .args(["db", "pull", "-j", "1", "--db"])
+            .arg(&db_dir)
+            .arg("--api-url")
+            .arg(&uri)
+            .args([
+                "-p",
+                "elementor:1,elementor2:1,chaty-pro2:1,zhaket-woo-sep:1,broken:1,bad slug:1",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a failure exits 1: {text}");
+    let section = |title: &str| {
+        let start = text
+            .find(title)
+            .unwrap_or_else(|| panic!("{title} missing:\n{text}"));
+        text[start..].to_string()
+    };
+    let naming = section("probably a naming problem (1)");
+    assert!(
+        naming.contains("\"elementor2\" = \"elementor\"   (in [plugin]"),
+        "{naming}"
+    );
+    let maybe = section("maybe a naming problem (1)");
+    assert!(
+        maybe.contains("chaty-pro2: maybe \"chaty-pro\" or \"chaty\""),
+        "{maybe}"
+    );
+    assert!(section("not tracked (1)").contains("zhaket-woo-sep"));
+    assert!(section("Failed (1)").contains("broken: HTTP 500"));
+    assert!(section("Invalid names (1)").contains("\"bad slug\""));
+}
+
+#[test]
+fn scan_report_carries_input_warnings_and_name_hints() {
+    let dir = temp_db("scan-warnings");
+    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+    std::fs::write(dir.join("plugin/akismet.json"), record("")).unwrap();
+    let aliases = dir.join("aliases.toml");
+    std::fs::write(&aliases, "[plugin]\n\"gone-plugin\" = \"gone\"\n").unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wp");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wordpress-vulnerable-scanner"))
+        .args(["scan", "--db"])
+        .arg(&dir)
+        .arg("--inventory")
+        .arg(&fixture)
+        .arg("--aliases")
+        .arg(&aliases)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("gone-plugin"),
+        "not lost on stderr: {stderr}"
+    );
+    let warnings = &text[text.find("WARNINGS (").expect("warnings section")..];
+    assert!(warnings.contains("\"gone-plugin\": no installed plugin has this slug"));
+    assert!(
+        warnings.contains("inventory: "),
+        "inventory warnings included"
+    );
+    // akismet-old (unloaded copy) is not pulled, but akismet is: a naming problem
+    assert!(
+        text.contains("\"akismet-old\" = \"akismet\"   (in [plugin])"),
+        "{text}"
+    );
+    assert!(text.find("WARNINGS (").unwrap() < text.find("Summary:").unwrap());
+}

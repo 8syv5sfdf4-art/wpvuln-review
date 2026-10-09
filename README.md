@@ -347,7 +347,21 @@ Every component ends in exactly one state, in the JSON (`state`) and the report:
 
 The summary counts unchecked components next to the vulnerabilities, so
 "0 vulnerabilities, 12 not checked" cannot be mistaken for a clean bill of
-health. This applies to live API scans as well as `--db` scans. `--db` and `--api-url`
+health. This applies to live API scans as well as `--db` scans.
+
+When a component is not checked only because of its name (a renamed, premium
+or backup copy such as `elementor2` or `wp-rocket--`), the report says so: with
+`--db`, it looks up the likely original slugs in the database and prints the
+exact `aliases.toml` line (`suggested_alias` in JSON and CSV, tagged
+`naming-problem` in DefectDojo). Problems with the inputs themselves (alias
+entries that cannot work, what the inventory could not resolve) are listed in a
+WARNINGS section of the report and in `warnings` in the JSON, not just on
+stderr.
+
+`db pull` and `db update` end the same way: what is not tracked, split into
+probable naming problems (with the alias line), possible ones (with the command
+to check them) and code no database covers; what failed and why; names that
+are not usable slugs; and warnings about the inputs. `--db` and `--api-url`
 (for a self-hosted mirror) can also be set with `WPVULN_DB` and `WPVULN_API`.
 
 ## Output Formats
@@ -355,8 +369,32 @@ health. This applies to live API scans as well as `--db` scans. `--db` and `--ap
 | Format | Flag | Description |
 |--------|------|-------------|
 | Human | `-o human` | Colored table (default) |
-| JSON | `-o json` | Machine-readable JSON |
+| JSON | `-o json` | Machine-readable JSON, with a `state` per component |
+| CSV | `-o csv` | One row per finding, plus one per component without findings |
+| Markdown | `-o markdown` | Report for people: summary, findings, alias matches, not checked |
+| DefectDojo | `-o defectdojo` | DefectDojo "Generic Findings Import" JSON |
 | None | `-o none` | Silent (exit code only) |
+
+Every format accounts for every component, including the ones that could not
+be checked, with the reason. `--severity` hides lower findings from the human,
+CSV and Markdown reports; JSON always holds everything.
+
+### DefectDojo
+
+```bash
+wordpress-vulnerable-scanner scan --db wpvuln-db --inventory inventory.json \
+    --aliases aliases.toml -o defectdojo > findings.json
+```
+
+Import `findings.json` as scan type **Generic Findings Import**. Only fields
+DefectDojo 3 documents are used, since any other key aborts the import:
+title, severity, description, CVE (and further ids), CVSS v3 vector and score,
+CWE, component name and version, references, fix availability and version,
+mitigation, KEV, EPSS and tags. `unique_id_from_tool` is stable
+(`plugin/<installed slug>/<record uuid>`), so re-imports deduplicate.
+Components that could not be checked become **Info** findings tagged
+`not-checked`, and findings through an alias are tagged `alias-match` and left
+unverified, so neither gets lost in the tracker.
 
 ## Exit Codes
 

@@ -41,6 +41,7 @@ pub mod error;
 pub(crate) mod http;
 pub mod inventory;
 pub mod output;
+pub(crate) mod report;
 pub mod scanner;
 pub mod transfer;
 pub mod vulnerability;

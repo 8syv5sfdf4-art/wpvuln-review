@@ -15,6 +15,12 @@ pub enum OutputFormat {
     Human,
     /// JSON output
     Json,
+    /// CSV: one row per finding, and per component without findings
+    Csv,
+    /// Markdown report for people
+    Markdown,
+    /// DefectDojo Generic Findings Import JSON
+    DefectDojo,
     /// No output (silent mode)
     None,
 }
@@ -26,6 +32,9 @@ impl FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "human" => Ok(Self::Human),
             "json" => Ok(Self::Json),
+            "csv" => Ok(Self::Csv),
+            "markdown" | "md" => Ok(Self::Markdown),
+            "defectdojo" => Ok(Self::DefectDojo),
             "none" => Ok(Self::None),
             _ => Err(Error::InvalidOutputFormat(s.to_string())),
         }
@@ -80,6 +89,13 @@ pub fn output_analysis<W: Write>(
     match config.format {
         OutputFormat::Human => output_human(analysis, config, writer),
         OutputFormat::Json => output_json(analysis, writer),
+        OutputFormat::Csv => crate::report::write_csv(analysis, config.min_severity, writer),
+        OutputFormat::Markdown => {
+            crate::report::write_markdown(analysis, config.min_severity, writer)
+        }
+        OutputFormat::DefectDojo => {
+            crate::report::write_defectdojo(analysis, config.min_severity, writer)
+        }
         OutputFormat::None => Ok(()),
     }
 }
@@ -108,6 +124,10 @@ fn output_human<W: Write>(
     if !summary.has_any() {
         if summary.not_checked == 0 {
             writeln!(writer, "No vulnerabilities found.")?;
+            if !analysis.warnings.is_empty() {
+                writeln!(writer)?;
+                write_warnings(analysis, config.color, writer)?;
+            }
             return Ok(());
         }
         writeln!(
@@ -116,6 +136,7 @@ fn output_human<W: Write>(
             analysis.components.len() - summary.not_checked
         )?;
         write_not_checked(analysis, config.color, writer)?;
+        write_warnings(analysis, config.color, writer)?;
         write_summary(analysis, writer)?;
         return Ok(());
     }
@@ -186,6 +207,7 @@ fn output_human<W: Write>(
 
     write_alias_notes(analysis, config.color, writer)?;
     write_not_checked(analysis, config.color, writer)?;
+    write_warnings(analysis, config.color, writer)?;
     write_summary(analysis, writer)?;
     Ok(())
 }
@@ -253,6 +275,43 @@ fn write_not_checked<W: Write>(analysis: &Analysis, color: bool, writer: &mut W)
             color
         )
     )?;
+    let with_version = |c: &ComponentVulnerabilities| {
+        format!(
+            "{} {}",
+            display_name(c),
+            c.version.as_deref().unwrap_or("(no version)")
+        )
+    };
+
+    // Unchecked only because of the name: the fix is one line in aliases.toml
+    let renamed: Vec<_> = analysis
+        .components
+        .iter()
+        .filter(|c| c.suggested_alias.is_some())
+        .collect();
+    if !renamed.is_empty() {
+        writeln!(
+            writer,
+            "  probably a naming problem ({}): the database tracks these under another slug; \
+             if they are the same, add the lines to aliases.toml",
+            renamed.len()
+        )?;
+        for c in &renamed {
+            let table = match c.component_type {
+                crate::scanner::ComponentType::Theme => "theme",
+                _ => "plugin",
+            };
+            writeln!(
+                writer,
+                "    {:<44} \"{}\" = \"{}\"   (in [{table}])",
+                with_version(c),
+                c.slug,
+                c.suggested_alias.as_deref().unwrap_or_default()
+            )?;
+        }
+    }
+
+    let mut name_hints = !renamed.is_empty();
     for (state, why) in [
         (
             ComponentState::Untracked,
@@ -274,26 +333,87 @@ fn write_not_checked<W: Write>(analysis: &Analysis, color: bool, writer: &mut W)
         let hits: Vec<_> = analysis
             .components
             .iter()
-            .filter(|c| c.state == state)
+            .filter(|c| c.state == state && c.suggested_alias.is_none())
             .collect();
         if hits.is_empty() {
             continue;
         }
         writeln!(writer, "  {} ({}): {why}", state.label(), hits.len())?;
         for c in hits {
+            let looks_renamed = c
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("looks like a renamed"));
+            name_hints |= looks_renamed;
             let detail = match state {
-                ComponentState::UnknownVersion | ComponentState::Failed => c
+                ComponentState::UnknownVersion | ComponentState::Failed => c.note.clone(),
+                _ if looks_renamed => c
                     .note
                     .as_deref()
-                    .map(|n| format!(" ({n})"))
-                    .unwrap_or_default(),
-                _ => String::new(),
+                    .and_then(|n| n.split_once("; the name "))
+                    .map(|(_, rest)| format!("the name {rest}")),
+                _ => None,
             };
-            writeln!(writer, "    {}{detail}", display_name(c))?;
+            match detail {
+                Some(d) => writeln!(writer, "    {}: {d}", with_version(c))?,
+                None => writeln!(writer, "    {}", with_version(c))?,
+            }
         }
+    }
+    if name_hints {
+        writeln!(
+            writer,
+            "  To find the right slugs for renamed or premium copies in one go:\n    \
+             wordpress-vulnerable-scanner aliases suggest <inventory.json> --db <db> --online"
+        )?;
     }
     writeln!(writer)?;
     Ok(())
+}
+
+/// Problems with the scan's own setup, numbered and wrapped
+fn write_warnings<W: Write>(analysis: &Analysis, color: bool, writer: &mut W) -> Result<()> {
+    if analysis.warnings.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        writer,
+        "{}",
+        colorize(
+            &format!("WARNINGS ({})", analysis.warnings.len()),
+            Color::Yellow,
+            color
+        )
+    )?;
+    let digits = analysis.warnings.len().to_string().len();
+    let indent = " ".repeat(digits + 4);
+    for (i, w) in analysis.warnings.iter().enumerate() {
+        writeln!(
+            writer,
+            "  {:>digits$}. {}",
+            i + 1,
+            wrap(w, 96 - indent.len()).join(&format!("\n{indent}"))
+        )?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+/// Greedy word wrap for terminal messages
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("never empty");
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
 }
 
 fn write_summary<W: Write>(analysis: &Analysis, writer: &mut W) -> Result<()> {
