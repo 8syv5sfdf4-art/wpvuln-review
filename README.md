@@ -161,6 +161,54 @@ missing versions, folders with several plugin headers, symlinks leaving the
 tree, and unsafe archive paths. Each warning says what it means for the scan
 and what to do about it.
 
+## Aliases: folder name to wordpress.org slug
+
+Vulnerability data is keyed by wordpress.org slug, but WordPress folders are
+often named differently: premium editions (`chaty-pro2`), backup copies
+(`elementor2`), or plugins that ship with a theme (`woodmart-plus`). Without a
+mapping those look untracked and are not checked. Write the mapping by hand in
+`aliases.toml`:
+
+```toml
+[plugin]
+"chaty-pro2" = "chaty"
+"yith-woocommerce-product-bundles-premium" = "yith-woocommerce-product-bundles"
+"woodmart-plus" = { theme = "woodmart" }   # covered by the theme's own check
+
+[theme]
+"flatsome-old" = "flatsome"
+```
+
+```bash
+wordpress-vulnerable-scanner inventory plugins.tar.gz --aliases aliases.toml --format list
+```
+
+`aliases suggest` proposes entries. It never writes a file; it prints TOML to
+review:
+
+```bash
+wordpress-vulnerable-scanner aliases suggest inventory.json --db wpvuln-db > suggested.toml
+```
+
+Candidates come from the folder name (lowercased; `-premium`, `-pro`, `-old`,
+`-main`, `-master`, `--` and trailing digits dropped), the Text Domain header,
+a Plugin URI on wordpress.org, and plugins named after an installed theme. With
+`--db`, components already tracked under their own slug are skipped, and only a
+candidate the database tracks becomes an active line; everything else stays
+commented out with the reason. Components with no candidate at all are listed
+too, so custom code is never silently assumed covered.
+
+Add `--online` to ask the API about slugs the local database does not have
+(politely, 4 at a time). The answers go to a temporary directory that is
+deleted afterwards, so `--db` is never modified.
+
+With `--aliases` the inventory records each component's `lookup_slug` (and
+`lookup_type` for the `{ theme = ... }` form), and the list output uses the
+lookup slug with a comment naming the installed folder. Matches found through
+an alias should be confirmed: premium editions do not always number their
+versions like the free plugin. Entries that cannot work (the plugin is not
+installed, or the target theme is missing) are reported as warnings.
+
 ## Offline scans (local database)
 
 For air-gapped servers, CI without outbound access, or simply to avoid

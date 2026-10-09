@@ -9,6 +9,7 @@
 //! - Supports multiple input modes: URL, direct component list, list file, or JSON manifest
 //! - Can pull records into a local database and scan fully offline ([`db`])
 //! - Lists installed plugins, themes and core from a directory or an archive ([`inventory`])
+//! - Maps installed folder names to wordpress.org slugs ([`aliases`])
 //! - Outputs results in human-readable or JSON format
 //!
 //! # Example
@@ -31,6 +32,7 @@
 
 #![warn(missing_docs)]
 
+pub mod aliases;
 pub mod analyze;
 pub mod db;
 pub mod error;

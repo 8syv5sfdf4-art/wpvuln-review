@@ -1,0 +1,89 @@
+# Alias suggestions. Nothing here is applied automatically: review each entry,
+# then copy the lines you agree with into aliases.toml.
+# Matches found through an alias are labelled "alias" in reports, because
+# premium editions may number their versions differently from the free plugin.
+# Candidates checked against: test database
+
+[plugin]
+
+# RTL-CareUnit: RTL CareUnit 1.7 (RTL-CareUnit/RTL-CareUnit.php)
+#   own slug: not tracked
+#   RTL-CareUnit = "rtl-careunit": not tracked; lowercased
+#   none of these is tracked, so there is nothing to map to; it stays
+#   "not checked".
+
+# bom-plugin: BOM Plugin 1.0.0 (bom-plugin/bom-plugin.php)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# chaty-pro2: Chaty Pro 3.3.6 (chaty-pro2/cht-icons.php)
+#   own slug: not tracked
+#   chaty-pro2 = "chaty-pro": not in the database; dropped trailing digits
+#   chaty-pro2 = "chaty": tracked, 2 records; dropped trailing digits, dropped "-pro"; Text Domain header
+"chaty-pro2" = "chaty"
+
+# crlf-plugin: CRLF Plugin 2.0.1 (crlf-plugin/crlf-plugin.php)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# edge-after: Edge After (no version) (edge-after/edge-after.php)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# edge-before: Edge Before 1.2.3 (edge-before/edge-before.php)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# empty-version: Empty Version 3.1.4 (empty-version/empty-version.php)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# hello: Hello Dolly 1.7.2 (hello.php)
+#   own slug: not tracked
+#   hello = "hello-dolly": not tracked; Plugin/Theme URI points to wordpress.org
+#   none of these is tracked, so there is nothing to map to; it stays
+#   "not checked".
+
+# latin1: Latin1 0.9 (latin1/latin1.php)
+#   own slug: not tracked
+#   latin1 = "latin": not tracked; dropped trailing digits
+#   none of these is tracked, so there is nothing to map to; it stays
+#   "not checked".
+
+# two-headers: Two Headers A 1.0 (two-headers/a.php); also Two Headers B 2.0 (two-headers/b.php)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# yith-woocommerce-product-bundles-premium: YITH WooCommerce Product Bundles Premium 2.18.0 (yith-woocommerce-product-bundles-premium/init.php)
+#   own slug: not tracked
+#   yith-woocommerce-product-bundles-premium = "yith-woocommerce-product-bundles": not tracked; dropped "-premium"; Text Domain header
+#   none of these is tracked, so there is nothing to map to; it stays
+#   "not checked".
+
+# akismet-old: Akismet Anti-spam 4.0 (Old Plugins/akismet-old/akismet.php, not loaded by WordPress)
+#   own slug: not tracked
+#   akismet-old = "akismet": tracked, 5 records; dropped "-old"
+"akismet-old" = "akismet"
+
+[theme]
+
+# flatsome: Flatsome 3.18.7 (flatsome-download/flatsome/style.css)
+#   own slug: not tracked
+#   no candidate slug found. Probably custom or marketplace code that no
+#   database covers; it stays "not checked", so review it by hand.
+
+# orphan-child: Orphan Child 0.1 (orphan-child/style.css)
+#   own slug: not tracked
+#   child theme of "missing-parent": it holds this site's own changes, which no
+#   database covers, so review it by hand. The parent is checked on its own.
+
+# storefront-child: Storefront Child 1.0.0 (storefront-child/style.css)
+#   own slug: not tracked
+#   child theme of "storefront": it holds this site's own changes, which no
+#   database covers, so review it by hand. The parent is checked on its own.
